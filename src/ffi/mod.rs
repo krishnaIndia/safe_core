@@ -62,7 +62,8 @@ use core::translated_events::NetworkEvent;
 use core::errors::CoreError;
 use std::ptr;
 use std::sync::mpsc::Sender;
-
+use nfs::helper::writer::Writer;
+use ffi::nfs::get_file_writer::WriterWrapper;
 
 /// ParameterPacket acts as a holder for the standard parameters that would be needed for performing
 /// operations across the modules like nfs and dns
@@ -322,8 +323,9 @@ pub extern "C" fn execute_for_content(c_payload: *const c_char,
                                     c_result);
     let mut json_decoder = json::Decoder::new(json_request.clone());
     let client = cast_from_ffi_handle(ffi_handle);
-    let (module, action, parameter_packet) =
-        ffi_ptr_try!(get_parameter_packet(client, &mut json_decoder), c_result);
+    let (module, action, parameter_packet) = ffi_ptr_try!(get_parameter_packet(client,
+                                                                               &mut json_decoder),
+                                                          c_result);
     // TODO Krishna: Avoid parsing it twice (line 292). for get_parameter_packet pass the json
     // object and iterate. parse based on keys
     json_decoder = json::Decoder::new(json_request.clone());
@@ -345,6 +347,55 @@ pub extern "C" fn execute_for_content(c_payload: *const c_char,
     ptr
 }
 
+/// Obtain NFS writter handle for writing data to a file in streaming mode
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "C" fn get_nfs_writer(c_payload: *const c_char,
+                                 ffi_handle: *const c_void,
+                                 writer_handle: *mut *const c_void)
+                                 -> int32_t {
+    let payload: String = ffi_try!(helper::c_char_ptr_to_string(c_payload));
+    let json_request = ffi_try!(parse_result!(json::Json::from_str(&payload), "JSON parse error"));
+    let mut json_decoder = json::Decoder::new(json_request);
+    let client = cast_from_ffi_handle(ffi_handle);
+    let (_, _, parameter_packet) = ffi_try!(get_parameter_packet(client, &mut json_decoder));
+    let mut get_file_writer = ffi_try!(parse_result!(json_decoder.read_struct_field("data",
+                                                                                    0,
+                                                                                    |d| {
+                                            nfs::get_file_writer::GetFileWriter::decode(d)
+                                        }),
+                                        ""));
+    let writer_wrapper = ffi_try!(get_file_writer.execute(parameter_packet));
+    unsafe {
+        *writer_handle = Box::into_raw(Box::new(writer_wrapper)) as *mut c_void;
+    }
+
+    0
+}
+
+/// Write data to the Network using the NFS Writer handle
+#[no_mangle]
+#[allow(unsafe_code)]
+pub fn nfs_stream_write(handle: *mut c_void) -> int32_t {
+    let mut a = unsafe { Box::from_raw(handle as *mut WriterWrapper) };
+    let mut writer = unsafe { Box::from_raw(a.get_writer_ptr() as *mut Writer) };
+    ffi_try!(writer.write(&[0u8; 10], 0));
+    mem::forget(writer);
+    mem::forget(a);
+
+    0
+}
+
+/// Closes the NFS Writter handle
+#[no_mangle]
+#[allow(unsafe_code)]
+pub fn nfs_stream_close(handle: *mut c_void) -> int32_t {
+    let mut a = unsafe { Box::from_raw(handle as *mut WriterWrapper) };
+    let writer = unsafe { Box::from_raw(a.get_writer_ptr() as *mut Writer) };
+    let _ = ffi_try!(writer.close());    
+    0
+}
+
 #[no_mangle]
 #[allow(unsafe_code)]
 /// Drop the vector returned as a result of the execute_for_content fn
@@ -359,6 +410,7 @@ pub fn drop_null_ptr(ptr: *mut u8) {
     let _ = unsafe { libc::free(ptr as *mut c_void) };
 }
 
+
 fn get_parameter_packet<D>(client: Arc<Mutex<Client>>,
                            json_decoder: &mut D)
                            -> Result<(String, String, ParameterPacket), FfiError>
@@ -366,24 +418,29 @@ fn get_parameter_packet<D>(client: Arc<Mutex<Client>>,
           D::Error: ::std::fmt::Debug
 {
 
-    let module: String =
-        try!(parse_result!(json_decoder.read_struct_field("module", 0, Decodable::decode),
-                           ""));
-    let action: String =
-        try!(parse_result!(json_decoder.read_struct_field("action", 1, Decodable::decode),
-                           ""));
+    let module: String = try!(parse_result!(json_decoder.read_struct_field("module",
+                                                                           0,
+                                                                           Decodable::decode),
+                                            ""));
+    let action: String = try!(parse_result!(json_decoder.read_struct_field("action",
+                                                                           1,
+                                                                           Decodable::decode),
+                                            ""));
     let base64_safe_drive_dir_key: Option<String> =
         json_decoder.read_struct_field("safe_drive_dir_key", 2, Decodable::decode)
-            .ok();
+                    .ok();
 
-    let base64_app_dir_key: Option<String> =
-        json_decoder.read_struct_field("app_dir_key", 3, Decodable::decode)
-            .ok();
+    let base64_app_dir_key: Option<String> = json_decoder.read_struct_field("app_dir_key",
+                                                                            3,
+                                                                            Decodable::decode)
+                                                         .ok();
     let safe_drive_access: bool = if base64_safe_drive_dir_key.is_none() {
         false
     } else {
-        try!(parse_result!(
-                json_decoder.read_struct_field("safe_drive_access", 4, Decodable::decode), ""))
+        try!(parse_result!(json_decoder.read_struct_field("safe_drive_access",
+                                                          4,
+                                                          Decodable::decode),
+                           ""))
     };
     let app_root_dir_key: Option<DirectoryKey> = if let Some(app_dir_key) = base64_app_dir_key {
         let serialised_app_dir_key: Vec<u8> = try!(parse_result!(app_dir_key[..].from_base64(),
@@ -396,8 +453,9 @@ fn get_parameter_packet<D>(client: Arc<Mutex<Client>>,
 
     let safe_drive_dir_key: Option<DirectoryKey> = if let Some(safe_dir_key) =
                                                           base64_safe_drive_dir_key {
-        let serialised_safe_drive_key: Vec<u8> =
-            try!(parse_result!(safe_dir_key[..].from_base64(), ""));
+        let serialised_safe_drive_key: Vec<u8> = try!(parse_result!(safe_dir_key[..]
+                                                                        .from_base64(),
+                                                                    ""));
         let dir_key: DirectoryKey = try!(deserialise(&serialised_safe_drive_key));
         Some(dir_key)
     } else {
