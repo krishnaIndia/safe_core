@@ -15,6 +15,8 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
+use ::time::now_utc;
+
 use ffi::{Action, ParameterPacket, ResponseType, helper};
 use ffi::errors::FfiError;
 use nfs::helper::file_helper::FileHelper;
@@ -75,6 +77,7 @@ impl Action for ModifyFile {
         }
 
         if metadata_updated {
+            file.get_mut_metadata().set_modified_time(now_utc());
             let _ = try!(file_helper.update_metadata(file.clone(), &mut dir_of_file));
         }
 

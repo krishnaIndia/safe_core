@@ -15,6 +15,8 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
+use ::time::now_utc;
+
 use ffi::{Action, ParameterPacket, ResponseType, helper};
 use ffi::errors::FfiError;
 use nfs::helper::directory_helper::DirectoryHelper;
@@ -64,6 +66,7 @@ impl Action for ModifyDir {
             dir_to_modify.get_mut_metadata().set_user_metadata(metadata);
         }
 
+        dir_to_modify.get_mut_metadata().set_modified_time(now_utc());
         let _ = try!(directory_helper.update(&dir_to_modify));
 
         Ok(None)
