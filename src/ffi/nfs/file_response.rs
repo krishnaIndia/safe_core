@@ -18,6 +18,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use ::time::strftime;
+
 use core::client::Client;
 use ffi::config;
 use ffi::errors::FfiError;
@@ -38,10 +40,8 @@ struct Metadata {
     name: String,
     size: i64,
     user_metadata: String,
-    creation_time_sec: i64,
-    creation_time_nsec: i64,
-    modification_time_sec: i64,
-    modification_time_nsec: i64,
+    creation_time: String,
+    modification_time: String,
 }
 
 pub fn get_response(file: &File,
@@ -51,7 +51,7 @@ pub fn get_response(file: &File,
                     include_metadata: bool)
                     -> Result<GetFileResponse, FfiError> {
     let file_metadata = if include_metadata {
-        Some(get_file_metadata(file.get_metadata()))
+        Some(try!(get_file_metadata(file.get_metadata())))
     } else {
         None
     };
@@ -68,20 +68,19 @@ pub fn get_response(file: &File,
     })
 }
 
-fn get_file_metadata(file_metadata: &FileMetadata) -> Metadata {
+fn get_file_metadata(file_metadata: &FileMetadata) -> Result<Metadata, FfiError>  {
     use rustc_serialize::base64::ToBase64;
 
-    let created_time = file_metadata.get_created_time().to_timespec();
-    let modified_time = file_metadata.get_modified_time().to_timespec();
-    Metadata {
+    let date_fmt = "%Y-%m-%dT%H:%M:%S.%fz";
+    let created_time = try!(strftime(date_fmt, file_metadata.get_created_time()));
+    let modified_time = try!(strftime(date_fmt, file_metadata.get_modified_time()));
+    Ok(Metadata {
         name: file_metadata.get_name().to_owned(),
         size: file_metadata.get_size() as i64,
         user_metadata: (*file_metadata.get_user_metadata()).to_base64(config::get_base64_config()),
-        creation_time_sec: created_time.sec,
-        creation_time_nsec: created_time.nsec as i64,
-        modification_time_sec: modified_time.sec,
-        modification_time_nsec: modified_time.nsec as i64,
-    }
+        creation_time: created_time,
+        modification_time: modified_time,
+    })
 }
 
 impl json::ToJson for GetFileResponse {

@@ -46,7 +46,7 @@ impl Action for GetDir {
                                                               &tokens,
                                                               Some(&start_dir_key)));
 
-        let response = convert_to_response(dir_fetched);
+        let response = try!(convert_to_response(dir_fetched));
 
         Ok(Some(try!(::rustc_serialize::json::encode(&response))))
     }

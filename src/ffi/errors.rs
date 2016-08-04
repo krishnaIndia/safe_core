@@ -17,6 +17,8 @@
 
 use std::fmt;
 
+use ::time::ParseError;
+
 use core::errors::CoreError;
 use dns::errors::{DNS_ERROR_START_RANGE, DnsError};
 use maidsafe_utilities::serialisation::SerialisationError;
@@ -58,6 +60,8 @@ pub enum FfiError {
     Unexpected(String),
     /// Could not serialise or deserialise data
     UnsuccessfulEncodeDecode(SerialisationError),
+    /// Parse time error
+    TimeParserError,
 }
 
 impl From<SerialisationError> for FfiError {
@@ -86,6 +90,12 @@ impl From<NfsError> for FfiError {
 impl From<DnsError> for FfiError {
     fn from(error: DnsError) -> FfiError {
         FfiError::DnsError(Box::new(error))
+    }
+}
+
+impl From<ParseError> for FfiError {
+    fn from(_: ParseError) -> FfiError {
+        FfiError::TimeParserError
     }
 }
 
@@ -129,6 +139,7 @@ impl Into<i32> for FfiError {
             FfiError::LocalConfigAccessFailed(_) => FFI_ERROR_START_RANGE - 8,
             FfiError::Unexpected(_) => FFI_ERROR_START_RANGE - 9,
             FfiError::UnsuccessfulEncodeDecode(_) => FFI_ERROR_START_RANGE - 10,
+            FfiError::TimeParserError => FFI_ERROR_START_RANGE - 11,
         }
     }
 }
@@ -161,6 +172,7 @@ impl fmt::Debug for FfiError {
             FfiError::UnsuccessfulEncodeDecode(ref err) => {
                 write!(f, "FfiError::UnsuccessfulEncodeDecode -> {:?}", err)
             }
+            FfiError::TimeParserError => { write!(f, "FfiError::TimeParserError") },
         }
     }
 }
