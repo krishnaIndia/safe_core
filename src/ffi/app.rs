@@ -130,6 +130,25 @@ pub unsafe extern "C" fn register_app(session_handle: *mut SessionHandle,
     })
 }
 
+
+/// Register an app with the launcher. The returned app handle must be disposed
+/// of by calling `drop_app` once no longer needed.
+#[no_mangle]
+pub unsafe extern "C" fn create_unauthorised_app(session_handle: *mut SessionHandle,
+                                          app_handle: *mut *mut App)
+                                          -> int32_t {
+    helper::catch_unwind_i32(|| {
+        let session = (*session_handle).clone();
+
+        let app = App::(session);
+
+        *app_handle = Box::into_raw(Box::new(app));
+        0
+    })
+}
+
+
+
 /// Discard and clean up the previously allocated app.
 #[no_mangle]
 pub unsafe extern "C" fn drop_app(app_handle: *mut App) {

@@ -53,5 +53,5 @@ name = "simulate_browser"
 use-mock-routing = []
 
 [lib]
-crate_type = ["staticlib", "rlib", "cdylib"]
+crate_type = ["lib", "staticlib", "dylib", "rlib", "cdylib"]
 name = "safe_core"
