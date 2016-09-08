@@ -159,7 +159,7 @@ pub unsafe extern "C" fn create_unauthorised_app(session_handle: *mut SessionHan
     helper::catch_unwind_i32(|| {
         let session = (*session_handle).clone();
 
-        let app = App::(session);
+        let app = App::unregistered(session);
 
         *app_handle = Box::into_raw(Box::new(app));
         0
