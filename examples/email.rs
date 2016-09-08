@@ -81,6 +81,7 @@ unsafe fn create_email(app_h: *mut App) {
     let mut email = String::new();
     println!("\nEnter email name of choice:");
     let _ = std::io::stdin().read_line(&mut email);
+    email = email.trim().to_string();
     let Digest(digest) = sha256::hash(email.as_bytes());
 
     let mut ad_h = 0;
@@ -94,10 +95,12 @@ unsafe fn send_email(app_h: *mut App) {
     let mut email = String::new();
     println!("\nEnter peer email address:");
     let _ = std::io::stdin().read_line(&mut email);
+    email = email.trim().to_string();
 
     let mut msg = String::new();
     println!("\nEnter message:");
     let _ = std::io::stdin().read_line(&mut msg);
+    msg = msg.trim().to_string();
 
     let Digest(digest) = sha256::hash(email.as_bytes());
 
@@ -140,6 +143,7 @@ unsafe fn read_email(app_h: *mut App) {
     let mut email = String::new();
     println!("\nEnter your email address:");
     let _ = std::io::stdin().read_line(&mut email);
+    email = email.trim().to_string();
     let Digest(digest) = sha256::hash(email.as_bytes());
 
     let mut data_id_h = 0;
@@ -153,7 +157,7 @@ unsafe fn read_email(app_h: *mut App) {
     let mut num_of_emails = 0;
     assert_eq!(appendable_data_num_of_data(ad_h, &mut num_of_emails), 0);
 
-    println!("You have a total of {} emails.", num_of_emails);
+    println!("\nYou have a total of {} email(s).", num_of_emails);
 
     for n in 0..num_of_emails {
         assert_eq!(appendable_data_nth_data_id(app_h, ad_h, n, &mut data_id_h),
@@ -190,7 +194,7 @@ unsafe fn read_email(app_h: *mut App) {
 
     assert_eq!(appendable_data_free(ad_h), 0);
 
-    println!("All Emails read successfully !");
+    println!("\n\nAll Emails read successfully !");
 }
 
 fn main() {
@@ -219,9 +223,10 @@ fn main() {
 
     loop {
         let mut opt = String::new();
-        println!("\n0) Create Email\n1) Send Email\n2) Read Email\n(Anything else to \
-                  exit)\nEnter Option:");
+        println!("\n0) Create Email\n1) Send Email\n2) Read Email\nx) Anything else to \
+                  exit\nEnter Option:");
         let _ = std::io::stdin().read_line(&mut opt);
+        opt = opt.trim().to_string();
         match &opt[..] {
             "0" => unsafe { create_email(app_h) },
             "1" => unsafe { send_email(app_h) },
@@ -235,5 +240,5 @@ fn main() {
         drop_session(session_h);
     }
 
-    println!("============================================================\n");
+    println!("============================ G O O D   B Y E ============================\n");
 }
