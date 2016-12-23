@@ -84,7 +84,8 @@ impl FfiString {
     /// Deallocate the string.
     /// Warning: use this only if the data is owned.
     pub unsafe fn deallocate(self) {
-        let _ = String::from_raw_parts(self.ptr, self.len, self.cap);
+        let vec_str = slice::from_raw_parts(self.ptr, self.len).to_vec();
+        let _ = String::from_utf8(vec_str);
     }
 }
 
