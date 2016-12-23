@@ -21,6 +21,7 @@
 
 use ffi_utils::{FfiString, ffi_string_free};
 use std::mem;
+use std::slice;
 
 /// Permission action
 #[repr(C)]
@@ -160,7 +161,7 @@ impl ContainerPermissionsArray {
     /// Consumes this `ContainerPermissionsArray` into a `Vec`
     #[allow(unsafe_code)]
     pub unsafe fn into_vec(self) -> Vec<ContainerPermissions> {
-        Vec::from_raw_parts(self.ptr, self.len, self.cap)
+        slice::from_raw_parts(self.ptr, self.len).to_vec()
     }
 }
 
@@ -202,7 +203,7 @@ impl PermissionArray {
     /// Consumes this `PermissionArray` into a `Vec`
     #[allow(unsafe_code)]
     pub unsafe fn into_vec(self) -> Vec<Permission> {
-        Vec::from_raw_parts(self.ptr, self.len, self.cap)
+        slice::from_raw_parts(self.ptr, self.len).to_vec()
     }
 }
 

@@ -92,7 +92,8 @@ impl Default for FfiString {
 /// Free the string from memory.
 #[no_mangle]
 pub unsafe extern "C" fn ffi_string_free(s: FfiString) {
-    let _ = String::from_raw_parts(s.ptr, s.len, s.cap);
+    let vec_str = slice::from_raw_parts(s.ptr, s.len).to_vec();
+    let _ = String::from_utf8(vec_str);
 }
 
 #[cfg(test)]
