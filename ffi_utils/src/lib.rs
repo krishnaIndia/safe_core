@@ -66,7 +66,7 @@ pub mod test_utils;
 pub use self::base64::{base64_decode, base64_encode};
 pub use self::byte_vec::{u8_ptr_to_vec, u8_vec_to_ptr};
 pub use self::catch_unwind::{catch_unwind_cb, catch_unwind_error_code};
-pub use self::string::{FfiString, ffi_string_free};
+pub use self::string::{FfiString, ffi_string_create, ffi_string_free};
 
 use std::os::raw::c_void;
 
