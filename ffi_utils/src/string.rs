@@ -99,6 +99,24 @@ impl Default for FfiString {
     }
 }
 
+/// Create a string from memory.
+#[no_mangle]
+pub unsafe extern "C" fn ffi_string_create(ptr: *mut u8,
+                                        len: usize,
+                                        o_ffi_str: *mut FfiString)
+                                        -> i32 {
+ let slice = slice::from_raw_parts(ptr, len);
+ let s = match str::from_utf8(slice) {
+     Ok(s) => s.to_string(),
+     Err(_) => return -1,
+ };
+
+ let ffi_str = FfiString::from_string(s);
+ *o_ffi_str = ffi_str;
+
+ 0
+}
+
 /// Free the string from memory.
 #[no_mangle]
 pub unsafe extern "C" fn ffi_string_free(s: FfiString) {
