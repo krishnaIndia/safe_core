@@ -39,6 +39,11 @@ pub struct FfiString {
 }
 
 impl FfiString {
+    /// Check if we have a null string
+    pub fn is_null(&self) -> bool {
+        self.ptr.is_null() || self.len == 0
+    }
+
     /// Construct owning `FfiString` from `String`. It has to be deallocated
     /// manually by calling `ffi_string_free`.
     pub fn from_string<T: Into<String>>(s: T) -> Self {
@@ -56,9 +61,7 @@ impl FfiString {
     }
 
     /// Construct non-owning `FfiSting` from `&str`.
-    pub fn from_str<T: AsRef<str>>(s: T) -> Self {
-        let s = s.as_ref();
-
+    pub fn from_str(s: &str) -> Self {
         FfiString {
             ptr: s.as_ptr() as *mut _,
             len: s.len(),
@@ -76,6 +79,13 @@ impl FfiString {
     pub unsafe fn as_str(&self) -> Result<&str, Utf8Error> {
         let s = slice::from_raw_parts(self.ptr, self.len);
         str::from_utf8(s)
+    }
+
+    /// Deallocate the string.
+    /// Warning: use this only if the data is owned.
+    pub unsafe fn deallocate(self) {
+        let vec_str = slice::from_raw_parts(self.ptr, self.len).to_vec();
+        let _ = String::from_utf8(vec_str);
     }
 }
 
@@ -110,8 +120,7 @@ pub unsafe extern "C" fn ffi_string_create(ptr: *mut u8,
 /// Free the string from memory.
 #[no_mangle]
 pub unsafe extern "C" fn ffi_string_free(s: FfiString) {
-    let vec_str = slice::from_raw_parts(s.ptr, s.len).to_vec();
-    let _ = String::from_utf8(vec_str);
+    s.deallocate()
 }
 
 #[cfg(test)]

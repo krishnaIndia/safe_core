@@ -28,10 +28,12 @@ mod errors;
 
 use ffi_utils::{base64_decode, base64_encode};
 use maidsafe_utilities::serialisation::{deserialise, serialise};
+use rand::{self, Rng};
 pub use self::errors::IpcError;
 pub use self::req::{AppExchangeInfo, AuthReq, ContainersReq, IpcReq};
 pub use self::req::ffi::Permission;
 pub use self::resp::{AccessContInfo, AppKeys, AuthGranted, IpcResp};
+use std::u32;
 
 // TODO: replace with `crust::Config`
 /// Placeholder for `crust::Config`
@@ -72,7 +74,7 @@ pub fn encode_msg(msg: &IpcMsg, prefix: &str) -> Result<String, IpcError> {
 
 /// Decode `IpcMsg` encoded with base64 encoding.
 pub fn decode_msg(encoded: &str) -> Result<IpcMsg, IpcError> {
-    // stip prefix.
+    // strip prefix.
     let payload = if let Some(index) = encoded.find(':') {
         encoded.split_at(index + 1).1
     } else {
@@ -80,4 +82,10 @@ pub fn decode_msg(encoded: &str) -> Result<IpcMsg, IpcError> {
     };
 
     Ok(deserialise(&base64_decode(payload)?)?)
+}
+
+/// Generate unique request ID.
+pub fn gen_req_id() -> u32 {
+    // Generate the number in range 1..MAX inclusive.
+    rand::thread_rng().gen_range(0, u32::MAX) + 1
 }
