@@ -2,73 +2,149 @@ env:
   global:
     - Features="use-mock-routing testing"
     - RUST_BACKTRACE=1
-    - PATH=$PATH:$HOME/.cargo/bin
-os:
-  - linux
-  - osx
+    - TARGET=x86_64-unknown-linux-gnu
+    - PATH="$PATH:$HOME/.cargo/bin"
+    - DEPLOY_RUST_V="1.14.0"
+    - CRATES_CONFIG='declare -a FMT_CHECK_CRATES=("ffi_utils" "safe_core" "safe_app" "safe_authenticator"); declare -a TEST_CRATES=("safe_core" "safe_app" "safe_authenticator"); declare -a DEPLOY_CRATES=("safe_app" "safe_authenticator"); declare -a DEPLOY_FEATURES=("use-mock-routing testing,dev")'
+
 language: rust
-rust:
-  - stable
-  - nightly-2017-04-28
-sudo: false
+rust: 1.14.0
+services: docker
+sudo: required
+dist: trusty
+
+addons:
+  apt:
+    packages:
+      - desktop-file-utils
+      - xdg-utils
+      - gcc-multilib
+      - musl
+      - musl-dev
+      - musl-tools
+      # - gcc-mingw-w64-base
+      # - binutils-mingw-w64-x86-64
+      # - g++-mingw-w64-x86-64
+      # - gcc-mingw-w64-x86-64
+      # - g++-mingw-w64
+      # - mingw-w64-x86-64-dev
+
+matrix:
+  fast_finish: true
+  include:
+
+    # check clippy:
+    - os: linux
+      env: CLIPPY_VERSION=0.0.128;
+      rust: nightly-2017-04-28
+
+
+    # Linux
+    - env: >
+        TARGET_NAME=linux-x64
+      os: linux
+
+    - env: >
+        TARGET=i686-unknown-linux-gnu
+        TARGET_NAME=linux-ia32
+      os: linux
+
+      # static linked
+    # - env: >
+    #     TARGET=i686-unknown-linux-musl
+    #   os: linux
+    - env: >
+        TARGET=x86_64-unknown-linux-musl
+      os: linux
+
+    # windows:
+    # - env: >
+    #     TARGET=i686-pc-windows-gnu
+    #     TARGET_NAME=win32-x32
+    #   os: linux
+    # - env: >
+    #     TARGET=x86_64-pc-windows-gnu
+    #     TARGET_NAME=win32-x64
+    #   os: linux
+
+    # OSX
+    - env: >
+        TARGET=i686-apple-darwin
+        TARGET_NAME=darwin-ia32
+        MACOSX_DEPLOYMENT_TARGET=10.7
+      os: osx
+    - env: >
+        TARGET=x86_64-apple-darwin
+        TARGET_NAME=darwin-x64
+        MACOSX_DEPLOYMENT_TARGET=10.7
+      os: osx
+
 branches:
   only:
     - master
     - dev
+    - /^v\d+\.\d+\.\d+.*$/
+
 cache:
   cargo: true
 
+before_install:
+  - set -e
+  - if [ ! -z $TRAVIS_TAG ]; then
+      curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain "$TRAVIS_RUST_VERSION";
+    fi
+  # - mkdir -p ~/.cargo/
+  # - cp .ci/cargo-config.toml ~/.cargo/config
+
 before_script:
+  # travis deploy bug on OSX systems:
+  # https://github.com/travis-ci/travis-ci/issues/6307
+  - if [ "$TRAVIS_OS_NAME" == "osx" ]; then
+     rvm get stable;
+    fi
+  # setup our target environment
+  - rustup target install $TARGET || true
   - (which cargo-install-update && cargo install-update cargo-update) || cargo install cargo-update
   - (which cargo-prune && cargo install-update cargo-prune) || cargo install cargo-prune
-  - if [ "${TRAVIS_RUST_VERSION}" = stable ]; then
-      (which rustfmt && cargo install-update rustfmt) || cargo install rustfmt;
-    elif [ "${TRAVIS_OS_NAME}" = linux ]; then
-      clippy_vers=0.0.128;
-      if ! cargo clippy --version | grep -q $clippy_vers; then
-        cargo install clippy --vers=$clippy_vers --force;
+  - if [ ! -z $CLIPPY_VERSION ]; then
+      if ! cargo clippy --version | grep -q $CLIPPY_VERSION; then
+        cargo install clippy --vers=$CLIPPY_VERSION --force;
       fi
+    else 
+      (which rustfmt && cargo install-update rustfmt) || cargo install rustfmt;
     fi
+
+
 script:
-  - if [ "${TRAVIS_RUST_VERSION}" = stable ]; then
-        (
-            set -x;
-            echo "--- Check format ---" &&
-            cd ffi_utils &&
-            cargo fmt -- --write-mode=diff &&
-            cd ../safe_core &&
-            cargo fmt -- --write-mode=diff &&
-            cd ../safe_app &&
-            cargo fmt -- --write-mode=diff &&
-            cd ../safe_authenticator &&
-            cargo fmt -- --write-mode=diff &&
-            echo "--- Test ffi_utils ---" &&
-            cd ../ffi_utils &&
-            cargo test  --verbose --release &&
-            echo "--- Check compilation against actual routing ---" &&
-            cd ../safe_core &&
-            cargo rustc --verbose --release &&
-            cargo rustc --verbose --features testing --release --profile test --lib -- -Zno-trans &&
-            cd ../safe_app &&
-            cargo rustc --verbose --features testing --release --profile test --lib -- -Zno-trans &&
-            cd ../safe_authenticator &&
-            cargo rustc --verbose --features testing --release --profile test --lib -- -Zno-trans &&
-            echo "--- Test against mock ---" &&
-            cd ../safe_core &&
-            cargo test --verbose --release --features "$Features" &&
-            cd ../safe_app &&
-            cargo test --verbose --release --features "$Features" &&
-            cd ../safe_authenticator &&
-            cargo test --verbose --release --features "$Features";
-        );
-    elif [ "${TRAVIS_OS_NAME}" = linux ]; then
-        (
-            set -x;
-            cd ffi_utils && unset Features && cargo clippy && cargo clippy --profile=test && export Features="use-mock-routing testing" &&
-            cd ../safe_core && cargo clippy && cargo clippy --profile=test --features="$Features" &&
-            cd ../safe_app && cargo clippy --profile=test --features="$Features" &&
-            cd ../safe_authenticator && cargo clippy --profile=test --features="$Features";
-        )
+  - if [ ! -z $CHECK_CLIPPY ]; then
+      bash .ci/clippy.sh;
+    elif [ -z $TRAVIS_TAG ]; then 
+      bash .ci/script.sh;
     fi
+
 before_cache:
   - cargo prune
+
+before_deploy:
+  - if [ ! -z $TRAVIS_TAG ]; then
+      bash .ci/before_deploy.sh;
+    fi
+
+deploy:
+  # TODO update `api_key.secure`
+  # - Create a `public_repo` GitHub token. Go to: https://github.com/settings/tokens/new
+  # - Encrypt it: `travis encrypt YOUR_TOKEN`
+  # - Paste the output down here
+  api_key:
+    secure: "xulXTBCGT8jK7XuRhbfahD/Z42uKlaXmblj6DN1ERq9I6qRy7Z4D4WRbwDtEl5PY6pfOZ9TocE72GeaG6QmSzdc8PMn+QIfri4Eb0EGAMCrEHo2ed7nTJqNcwGf2sENVEjXrvzxNJGaLK9H2L+7npZELg0Ei1zNdp4sQHOZWJ6C/kgbx6wz8zbBdtkm63JMNeRylyYxUwINahpdPeqmEMWWKiHlj5JOKNwQLLMQngzJHvSlrU0ZXvIWlHICNp6Ofk4cc5WykjNVbbXvaGm/nHjgfRIthracKkeTQHBi2ot14DgPrVkp/7+qfn64JApIyEhXkNJO3sJsUNccdgf3YPem3DrmkKhvEN5MBBjq5mVVU7xRs21c781wp9n0SMq/dIaqYRqtBbJniBL1qvUO1yOaK+rewTZCT97PAA10PvBo4F3jNgc8/OYUKIxXYo3n2r1BxovPir+CPYpm5vOjJ0nyYHY5vd939ZVuc1Fw+FQ7p7WsTQ6VKQV0CwMhbkBhLdZDcQvMiiEWTfQzY6LUYbXJN9/alueuZeR+syOSTw3Lb+MjuIslAxgWdRgGm26Am9RKmBgIjTZdLDQswJbrZ+QkudnQKfAk4E8PBhhb6k3vfPOvsuvhnyDa/+ahxiKfSml4J/G/PaBHCSYQCovcA6K7H3MEQLjMMhFHe3299N2o="
+  file_glob: true
+  file: "*.zip"
+  on:
+    # TODO Here you can pick which targets will generate binary releases
+    # In this example, there are some targets that are tested using the stable
+    # and nightly channels. This condition makes sure there is only one release
+    # for such targets and that's generated using the stable channel
+    condition: $TRAVIS_RUST_VERSION = "$DEPLOY_RUST_V"
+    tags: true
+  provider: releases
+  skip_cleanup: true

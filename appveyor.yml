@@ -1,13 +1,36 @@
 environment:
   global:
     RUST_BACKTRACE: 1
-  matrix:
-    - RUST_VERSION: stable
+    RUST_VERSION: 1.14.0
+    FEATURES: "use-mock-routing testing"
+    RELEASE_SUFFIX: '-dev'
 
+  # TODO These are all the build jobs. Adjust as necessary. Comment out what you
+  # don't need
+  matrix:
+    # MinGW
+    - TARGET: i686-pc-windows-gnu
+      TARGET_NAME: win32-ia32
+
+    - TARGET: x86_64-pc-windows-gnu
+      TARGET_NAME: win32-x64
+
+    # MSVC
+    # - TARGET: i686-pc-windows-msvc
+    #   TARGET_NAME: win-i686-msvc
+    # - TARGET: x86_64-pc-windows-msvc
+    #   TARGET_NAME: win-x86_64-msvc
+
+    # Testing other channels
+    # - TARGET: x86_64-pc-windows-gnu
+    #   RUST_VERSION: nightly
+    # - TARGET: x86_64-pc-windows-msvc
+    #   RUST_VERSION: nightly
 branches:
   only:
     - master
     - dev
+    - /^v\d+\.\d+\.\d+.*$/
 
 cache:
   - '%USERPROFILE%\.cargo'
@@ -15,29 +38,68 @@ cache:
 
 clone_depth: 1
 
-install:
-  - ps: |
-        $url = "https://github.com/maidsafe/QA/raw/master/appveyor/install_rustup.ps1"
-        Invoke-WebRequest $url -OutFile "install_rustup.ps1"
-        . ".\install_rustup.ps1"
-
-platform:
-  - x86
-  - x64
-
 configuration:
   - Release
+
+install:
+  - ps: >-
+      If ($Env:TARGET -eq 'x86_64-pc-windows-gnu') {
+        $Env:PATH += ';C:\msys64\mingw64\bin'
+      } ElseIf ($Env:TARGET -eq 'i686-pc-windows-gnu') {
+        $Env:PATH += ';C:\msys64\mingw32\bin'
+      }
+  - curl -sSf -o rustup-init.exe https://win.rustup.rs/
+  - rustup-init.exe -y --default-host %TARGET% --default-toolchain %RUST_VERSION%
+  - set PATH=%PATH%;C:\Users\appveyor\.cargo\bin
+  - rustc -Vv
+  - cargo -V
 
 build_script:
   - |-
     cd ffi_utils && cargo build --verbose --release
-    cd ..\safe_core && cargo rustc --verbose --release --features testing --profile test --lib -- -Zno-trans
-    cd ..\safe_app && cargo rustc --verbose --release --features testing --profile test --lib -- -Zno-trans
-    cd ..\safe_authenticator && cargo rustc --verbose --features testing --release --profile test --lib -- -Zno-trans
+    cd ..\safe_core && cargo rustc --target %TARGET% --verbose --release --features testing --profile test --lib -- --test -Zno-trans
+    cd ..\safe_app && cargo rustc --target %TARGET% --verbose --release --features testing --profile test --lib -- --test -Zno-trans
+    cd ..\safe_authenticator && cargo rustc --target %TARGET% --verbose --release --features testing --profile test --lib -- --test -Zno-trans
 
 test_script:
   - |-
-    cd ..\ffi_utils && cargo test --verbose --release
-    cd ..\safe_core && cargo test --verbose --release --features "use-mock-routing testing"
-    cd ..\safe_app && cargo test --verbose --release --features "use-mock-routing testing"
-    cd ..\safe_authenticator && cargo test --verbose --release --features "use-mock-routing testing"
+    cd ffi_utils && cargo test --target %TARGET% --verbose --release
+    cd ..\safe_core && cargo test --target %TARGET% --verbose --release --features "%FEATURES%"
+    cd ..\safe_app && cargo test --target %TARGET% --verbose --release --features "%FEATURES%"
+    cd ..\safe_authenticator && cargo test --target %TARGET% --verbose --release --features "%FEATURES%"
+    cd ..
+
+
+before_deploy:
+  # TODO This should happen for every set of features
+  - ps: |
+        $CRATE_NAME = "safe_app"
+        .ci\before_deploy.ps1 
+        $CRATE_NAME = "safe_authenticator"
+        .ci\before_deploy.ps1 
+
+
+deploy:
+  artifact: /.*\.zip/
+  # TODO update `auth_token.secure`
+  # - Create a `public_repo` GitHub token. Go to: https://github.com/settings/tokens/new
+  # - Encrypt it. Go to https://ci.appveyor.com/tools/encrypt
+  # - Paste the output down here
+  auth_token:
+    secure: zTlMH28wxFIAfZl/IdQ9xX9ElLj3TA02vbUD+bkDYPWBdCBLdFN4rsydE8CcsI9z
+  description: ''
+  on:
+    # TODO Here you can pick which targets will generate binary releases
+    # In this example, there are some targets that are tested using the stable
+    # and nightly channels. This condition makes sure there is only one release
+    # for such targets and that's generated using the stable channel
+    # RUST_VERSION: stable
+    appveyor_repo_tag: true
+  provider: GitHub
+
+cache:
+  - C:\Users\appveyor\.cargo\registry
+  - target
+
+build: false
+
