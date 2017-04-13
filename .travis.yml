@@ -8,7 +8,7 @@ env:
     - CRATES_CONFIG='declare -a FMT_CHECK_CRATES=("ffi_utils" "safe_core" "safe_app" "safe_authenticator"); declare -a TEST_CRATES=("safe_core" "safe_app" "safe_authenticator"); declare -a DEPLOY_CRATES=("safe_app" "safe_authenticator"); declare -a DEPLOY_FEATURES=("use-mock-routing testing,dev")'
 
 language: rust
-rust: 1.14.0
+rust: stable
 services: docker
 sudo: required
 dist: trusty
