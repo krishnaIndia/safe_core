@@ -4,7 +4,7 @@ env:
     - RUST_BACKTRACE=1
     - TARGET=x86_64-unknown-linux-gnu
     - PATH="$PATH:$HOME/.cargo/bin"
-    - DEPLOY_RUST_V="1.14.0"
+    - DEPLOY_RUST_V="stable"
     - CRATES_CONFIG='declare -a FMT_CHECK_CRATES=("ffi_utils" "safe_core" "safe_app" "safe_authenticator"); declare -a TEST_CRATES=("safe_core" "safe_app" "safe_authenticator"); declare -a DEPLOY_CRATES=("safe_app" "safe_authenticator"); declare -a DEPLOY_FEATURES=("use-mock-routing testing,dev")'
 
 language: rust
@@ -116,7 +116,7 @@ before_script:
 
 
 script:
-  - if [ ! -z $CHECK_CLIPPY ]; then
+  - if [ ! -z $CLIPPY_VERSION ]; then
       bash .ci/clippy.sh;
     elif [ -z $TRAVIS_TAG ]; then 
       bash .ci/script.sh;
