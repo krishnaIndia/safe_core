@@ -97,9 +97,5 @@ deploy:
     appveyor_repo_tag: true
   provider: GitHub
 
-cache:
-  - C:\Users\appveyor\.cargo\registry
-  - target
-
 build: false
 
