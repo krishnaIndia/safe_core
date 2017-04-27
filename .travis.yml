@@ -127,6 +127,12 @@ before_cache:
 
 before_deploy:
   - if [ ! -z $TRAVIS_TAG ]; then
+
+      if [ ! -f Cargo.lock ]; then
+        travis_wait 30 cargo generate-lockfile;
+        cargo clean;
+      fi
+
       bash .ci/before_deploy.sh;
     fi
 
