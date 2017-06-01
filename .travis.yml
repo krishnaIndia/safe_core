@@ -127,6 +127,7 @@ script:
       bash .ci/clippy.sh;
     elif [ -z $TRAVIS_TAG ]; then 
       bash .ci/script.sh;
+    fi  
   # - if [ "${TRAVIS_RUST_VERSION}" = 1.17.0 ]; then
   #       (
   #           set -x;
@@ -166,7 +167,7 @@ script:
   #           cd ../safe_app && cargo clippy --profile=test --features="$Features" &&
   #           cd ../safe_authenticator && cargo clippy --profile=test --features="$Features";
   #       )
-    fi
+  # fi
 
 before_cache:
   - cargo prune
