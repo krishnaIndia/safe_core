@@ -16,7 +16,7 @@
 // relating to use of the SAFE Network Software.
 
 use super::DataId;
-use super::vault::{Data, Vault};
+use super::vault::{self, Data, Vault, VaultGuard};
 use maidsafe_utilities::thread;
 use rand;
 use routing::{Authority, BootstrapConfig, ClientError, EntryAction, Event, FullId, ImmutableData,
@@ -26,7 +26,7 @@ use rust_sodium::crypto::sign;
 use std;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use tiny_keccak::sha3_256;
@@ -59,10 +59,8 @@ lazy_static! {
     static ref VAULT: Mutex<Vault> = Mutex::new(Vault::new());
 }
 
-fn lock_vault() -> MutexGuard<'static, Vault> {
-    let mut vault = unwrap!(VAULT.lock());
-    let _ = vault.load();
-    vault
+fn lock_vault(write: bool) -> VaultGuard<'static> {
+    vault::lock(&VAULT, write)
 }
 
 pub struct Routing {
@@ -71,6 +69,7 @@ pub struct Routing {
     client_auth: Authority<XorName>,
     max_ops_countdown: Option<Cell<u64>>,
     timeout_simulation: bool,
+    rate_limit_error_count: Cell<usize>,
 }
 
 impl Routing {
@@ -97,6 +96,7 @@ impl Routing {
                client_auth: client_auth,
                max_ops_countdown: None,
                timeout_simulation: false,
+               rate_limit_error_count: Cell::new(0),
            })
     }
 
@@ -105,7 +105,7 @@ impl Routing {
                             dst: Authority<XorName>,
                             msg_id: MessageId)
                             -> Result<(), InterfaceError> {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
@@ -117,7 +117,8 @@ impl Routing {
                 x => panic!("Unexpected authority: {:?}", x),
             };
 
-            match lock_vault().get_account(&name) {
+            let vault = lock_vault(false);
+            match vault.get_account(&name) {
                 Some(account) => Ok(*account.account_info()),
                 None => Err(ClientError::NoSuchAccount),
             }
@@ -140,15 +141,14 @@ impl Routing {
                      data: ImmutableData,
                      msg_id: MessageId)
                      -> Result<(), InterfaceError> {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
+        let mut vault = lock_vault(true);
         let data_name = *data.name();
 
         let res = {
-            let mut vault = lock_vault();
-
             self.verify_network_limits(msg_id, "put_idata")
                 .and_then(|_| vault.authorise_mutation(&dst, self.client_key()))
                 .and_then(|_| {
@@ -182,15 +182,17 @@ impl Routing {
                      name: XorName,
                      msg_id: MessageId)
                      -> Result<(), InterfaceError> {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
+        let vault = lock_vault(false);
+
         let res = if let Err(err) = self.verify_network_limits(msg_id, "get_idata") {
             Err(err)
+        } else if let Err(err) = vault.authorise_read(&dst, &name) {
+            Err(err)
         } else {
-            let vault = lock_vault();
-            vault.authorise_read(&dst, &name);
             match vault.get_data(&DataId::immutable(name)) {
                 Some(Data::Immutable(data)) => Ok(data),
                 _ => Err(ClientError::NoSuchData),
@@ -215,10 +217,11 @@ impl Routing {
                      msg_id: MessageId,
                      _requester: sign::PublicKey)
                      -> Result<(), InterfaceError> {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
+        let mut vault = lock_vault(true);
         let data_name = DataId::mutable(*data.name(), data.tag());
 
         let res = if let Err(err) = self.verify_network_limits(msg_id, "put_mdata") {
@@ -230,19 +233,15 @@ impl Routing {
                 x => panic!("Unexpected authority: {:?}", x),
             };
 
-            let mut vault = lock_vault();
             if vault.contains_data(&data_name) {
                 Err(ClientError::AccountExists)
             } else {
                 vault.insert_account(dst_name);
                 vault.insert_data(data_name, Data::Mutable(data));
-                vault.sync();
                 Ok(())
             }
         } else {
             // Put normal data.
-            let mut vault = lock_vault();
-
             vault
                 .authorise_mutation(&dst, self.client_key())
                 .and_then(|_| self.verify_owner(&dst, data.owners()))
@@ -618,7 +617,7 @@ impl Routing {
                                       dst: Authority<XorName>,
                                       msg_id: MessageId)
                                       -> Result<(), InterfaceError> {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
@@ -631,7 +630,8 @@ impl Routing {
                 x => panic!("Unexpected authority: {:?}", x),
             };
 
-            if let Some(account) = lock_vault().get_account(&name) {
+            let vault = lock_vault(false);
+            if let Some(account) = vault.get_account(&name) {
                 Ok((account.auth_keys().clone(), account.version()))
             } else {
                 Err(ClientError::NoSuchAccount)
@@ -655,7 +655,7 @@ impl Routing {
                         version: u64,
                         msg_id: MessageId)
                         -> Result<(), InterfaceError> {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
@@ -667,18 +667,12 @@ impl Routing {
                 x => panic!("Unexpected authority: {:?}", x),
             };
 
-            let mut vault = lock_vault();
-            let res = if let Some(account) = vault.get_account_mut(&name) {
+            let mut vault = lock_vault(true);
+            if let Some(account) = vault.get_account_mut(&name) {
                 account.ins_auth_key(key, version)
             } else {
                 Err(ClientError::NoSuchAccount)
-            };
-
-            if res.is_ok() {
-                vault.sync();
             }
-
-            res
         };
 
 
@@ -699,7 +693,7 @@ impl Routing {
                         version: u64,
                         msg_id: MessageId)
                         -> Result<(), InterfaceError> {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
@@ -711,18 +705,12 @@ impl Routing {
                 x => panic!("Unexpected authority: {:?}", x),
             };
 
-            let mut vault = lock_vault();
-            let res = if let Some(account) = vault.get_account_mut(&name) {
+            let mut vault = lock_vault(true);
+            if let Some(account) = vault.get_account_mut(&name) {
                 account.del_auth_key(&key, version)
             } else {
                 Err(ClientError::NoSuchAccount)
-            };
-
-            if res.is_ok() {
-                vault.sync();
             }
-
-            res
         };
 
         self.send_response(DEL_AUTH_KEY_DELAY_MS,
@@ -746,14 +734,21 @@ impl Routing {
             dst: dst,
         };
 
-        let sender = self.sender.clone();
+        self.send_event(delay_ms, event)
+    }
 
-        let _ = thread::named(DELAY_THREAD_NAME, move || {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-            if let Err(err) = sender.send(event) {
-                error!("mpsc-send failure: {:?}", err);
-            }
-        });
+    fn send_event(&self, delay_ms: u64, event: Event) {
+        if delay_ms > 0 {
+            let sender = self.sender.clone();
+            let _ = thread::named(DELAY_THREAD_NAME, move || {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                if let Err(err) = sender.send(event) {
+                    error!("mpsc-send failure: {:?}", err);
+                }
+            });
+        } else if let Err(err) = self.sender.send(event) {
+            error!("mpsc-send failure: {:?}", err);
+        }
     }
 
     fn client_name(&self) -> XorName {
@@ -776,15 +771,17 @@ impl Routing {
         where F: FnOnce(MutableData) -> Result<R, ClientError>,
               G: FnOnce(Result<R, ClientError>) -> Response
     {
-        lock_vault().authorise_read(&dst, &name);
-
         self.with_mdata(name,
                         tag,
                         msg_id,
                         None,
                         log_label,
                         delay_ms,
-                        |data, _| f(data),
+                        false,
+                        |data, vault| {
+                            vault.authorise_read(&dst, &name)?;
+                            f(data)
+                        },
                         g)
     }
 
@@ -807,7 +804,8 @@ impl Routing {
 
             let output = f(&mut data)?;
             vault.insert_data(DataId::mutable(name, tag), Data::Mutable(data));
-            vault.sync();
+            vault.commit_mutation(&dst);
+
             Ok(output)
         };
 
@@ -817,11 +815,9 @@ impl Routing {
                         Some(requester),
                         log_label,
                         delay_ms,
+                        true,
                         mutate,
-                        g)?;
-
-        lock_vault().commit_mutation(&dst);
-        Ok(())
+                        g)
     }
 
     fn with_mdata<F, G, R>(&self,
@@ -831,13 +827,14 @@ impl Routing {
                            requester: Option<sign::PublicKey>,
                            log_label: &str,
                            delay_ms: u64,
+                           write: bool,
                            f: F,
                            g: G)
                            -> Result<(), InterfaceError>
         where F: FnOnce(MutableData, &mut Vault) -> Result<R, ClientError>,
               G: FnOnce(Result<R, ClientError>) -> Response
     {
-        if self.timeout_simulation {
+        if self.simulate_network_errors(msg_id) {
             return Ok(());
         }
 
@@ -846,7 +843,7 @@ impl Routing {
         } else if let Err(err) = self.verify_requester(requester) {
             Err(err)
         } else {
-            let mut vault = lock_vault();
+            let mut vault = lock_vault(write);
             match vault.get_data(&DataId::mutable(name, tag)) {
                 Some(Data::Mutable(data)) => f(data, &mut *vault),
                 _ => {
@@ -900,22 +897,6 @@ impl Routing {
         }
     }
 
-    #[cfg(any(feature = "testing", test))]
-    pub fn set_network_limits(&mut self, max_ops_count: Option<u64>) {
-        self.max_ops_countdown = max_ops_count.map(Cell::new)
-    }
-
-    #[cfg(any(feature = "testing", test))]
-    pub fn simulate_disconnect(&self) {
-        let sender = self.sender.clone();
-        let _ = std::thread::spawn(move || unwrap!(sender.send(Event::Terminate)));
-    }
-
-    #[cfg(any(feature = "testing", test))]
-    pub fn set_simulate_timeout(&mut self, enable: bool) {
-        self.timeout_simulation = enable;
-    }
-
     pub fn bootstrap_config() -> Result<BootstrapConfig, InterfaceError> {
         Ok(BootstrapConfig::default())
     }
@@ -951,7 +932,49 @@ impl Routing {
                  })
     }
 
+    fn simulate_network_errors(&self, msg_id: MessageId) -> bool {
+        if self.timeout_simulation {
+            return true;
+        }
+
+        if self.rate_limit_error_count.get() > 0 {
+            self.rate_limit_error_count
+                .set(self.rate_limit_error_count.get() - 1);
+            self.send_event(0, Event::ProxyRateLimitExceeded(msg_id));
+            return true;
+        }
+
+        false
+    }
+
     fn client_key(&self) -> &sign::PublicKey {
         self.full_id.public_id().signing_public_key()
+    }
+}
+
+#[cfg(any(feature = "testing", test))]
+impl Routing {
+    pub fn set_network_limits(&mut self, max_ops_count: Option<u64>) {
+        self.max_ops_countdown = max_ops_count.map(Cell::new)
+    }
+
+    pub fn simulate_disconnect(&self) {
+        let sender = self.sender.clone();
+        let _ = std::thread::spawn(move || unwrap!(sender.send(Event::Terminate)));
+    }
+
+    pub fn set_simulate_timeout(&mut self, enable: bool) {
+        self.timeout_simulation = enable;
+    }
+
+    // The following `count` requests will fail with exceeded rate limit.
+    pub fn simulate_rate_limit_errors(&mut self, count: usize) {
+        self.rate_limit_error_count = Cell::new(count);
+    }
+}
+
+impl Drop for Routing {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Event::Terminate);
     }
 }

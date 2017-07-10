@@ -31,9 +31,10 @@ use self::mock::Routing;
 use super::DIR_TAG;
 use errors::CoreError;
 use event::{CoreEvent, NetworkEvent, NetworkTx};
-use event_loop::{CoreMsg, CoreMsgTx};
-use event_loop::CoreFuture;
-use futures::{self, Complete, Future};
+use event_loop::{CoreFuture, CoreMsgTx};
+use futures::{Complete, Future};
+use futures::future::{self, Either, FutureResult, Loop, Then};
+use futures::sync::oneshot;
 use ipc::BootstrapConfig;
 use lru_cache::LruCache;
 use maidsafe_utilities::serialisation::{deserialise, serialise};
@@ -48,6 +49,7 @@ use rust_sodium::crypto::sign::{self, Seed};
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::io;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -59,6 +61,7 @@ const CONNECTION_TIMEOUT_SECS: u64 = 40;
 const REQUEST_TIMEOUT_SECS: u64 = 180;
 const SEED_SUBPARTS: usize = 4;
 const IMMUT_DATA_CACHE_SIZE: usize = 300;
+const RETRY_DELAY_MS: u64 = 800;
 
 macro_rules! match_event {
     ($r:ident, $event:path) => {
@@ -72,15 +75,13 @@ macro_rules! match_event {
     }
 }
 
-macro_rules! oneshot {
-    ($client:ident, $event:path) => {{
-        let msg_id = MessageId::new();
-        let (hook, oneshot) = futures::oneshot();
-        let fut = oneshot.map_err(|_| CoreError::OperationAborted)
-            .and_then(|event| match_event!(event, $event));
-
-        (hook, $client.timeout(msg_id, fut), msg_id)
-    }}
+macro_rules! try_request {
+    ($op:expr) => {
+        match $op {
+            Ok(x) => x,
+            Err(err) => return SyncLoop::Break(Err(CoreError::from(err))),
+        }
+    }
 }
 
 macro_rules! wait_for_response {
@@ -91,19 +92,25 @@ macro_rules! wait_for_response {
                 ..
             }) => {
                 if res_msg_id == $msg_id {
-                    res.map_err(CoreError::RoutingClientError)
+                    SyncLoop::Break(res.map_err(CoreError::RoutingClientError))
                 } else {
                     warn!("Received response with unexpected message id");
-                    Err(CoreError::OperationAborted)
+                    SyncLoop::Break(Err(CoreError::OperationAborted))
                 }
+            }
+            Ok(Event::ProxyRateLimitExceeded(_)) => {
+                use std::thread::sleep;
+                debug!("Rate limit exceeded; retrying request after {} ms", RETRY_DELAY_MS);
+                sleep(Duration::from_millis(RETRY_DELAY_MS));
+                SyncLoop::Continue
             }
             Ok(x) => {
                 warn!("Received unexpected response: {:?}", x);
-                Err(CoreError::OperationAborted)
+                SyncLoop::Break(Err(CoreError::OperationAborted))
             }
             Err(err) => {
                 warn!("Failed to receive response: {:?}", err);
-                Err(CoreError::OperationAborted)
+                SyncLoop::Break(Err(CoreError::OperationAborted))
             }
         }
     }
@@ -113,12 +120,11 @@ macro_rules! wait_for_response {
 /// request from high level API's to the actual routing layer and manage all
 /// interactions with it. This is essentially a non-blocking Client with
 /// an asynchronous API using the futures abstraction from the futures-rs crate
-#[derive(Clone)]
-pub struct Client {
-    inner: Rc<RefCell<Inner>>,
+pub struct Client<T> {
+    inner: Rc<RefCell<Inner<T>>>,
 }
 
-struct Inner {
+struct Inner<T> {
     el_handle: Handle,
     routing: Routing,
     hooks: HashMap<MessageId, Complete<CoreEvent>>,
@@ -127,25 +133,29 @@ struct Inner {
     timeout: Duration,
     joiner: Joiner,
     session_packet_version: u64,
+    core_tx: CoreMsgTx<T>,
+    net_tx: NetworkTx,
 }
 
-impl Client {
+impl<T> Clone for Client<T> {
+    fn clone(&self) -> Self {
+        Client { inner: self.inner.clone() }
+    }
+}
+
+impl<T: 'static> Client<T> {
     /// This is a getter-only Gateway function to the Maidsafe network. It will
     /// create an unregistered random client, which can do very limited set of
     /// operations - eg., a Network-Get
-    pub fn unregistered<T>(el_handle: Handle,
-                           core_tx: CoreMsgTx<T>,
-                           net_tx: NetworkTx,
-                           config: Option<BootstrapConfig>)
-                           -> Result<Self, CoreError>
-        where T: 'static
-    {
+    pub fn unregistered(el_handle: Handle,
+                        core_tx: CoreMsgTx<T>,
+                        net_tx: NetworkTx,
+                        config: Option<BootstrapConfig>)
+                        -> Result<Self, CoreError> {
         trace!("Creating unregistered client.");
 
         let (routing, routing_rx) = setup_routing(None, config.clone())?;
-        let net_tx_clone = net_tx.clone();
-        let core_tx_clone = core_tx.clone();
-        let joiner = spawn_routing_thread(routing_rx, core_tx_clone, net_tx_clone);
+        let joiner = spawn_routing_thread(routing_rx, core_tx.clone(), net_tx.clone());
 
         Ok(Self::new(Inner {
                          el_handle: el_handle,
@@ -156,6 +166,8 @@ impl Client {
                          timeout: Duration::from_secs(REQUEST_TIMEOUT_SECS),
                          joiner: joiner,
                          session_packet_version: 0,
+                         net_tx: net_tx,
+                         core_tx: core_tx,
                      }))
     }
 
@@ -173,11 +185,11 @@ impl Client {
     /// derived from the supplied seed, so this seed needs to be strong. For ordinary users, it's
     /// recommended to use the normal `registered` function where the secrets can be what's easy
     /// to remember for the user while also being strong.
-    pub fn registered_with_seed<T>(seed: &str,
-                                   el_handle: Handle,
-                                   core_tx: CoreMsgTx<T>,
-                                   net_tx: NetworkTx)
-                                   -> Result<Client, CoreError>
+    pub fn registered_with_seed(seed: &str,
+                                el_handle: Handle,
+                                core_tx: CoreMsgTx<T>,
+                                net_tx: NetworkTx)
+                                -> Result<Client<T>, CoreError>
         where T: 'static
     {
         let arr = Self::divide_seed(seed)?;
@@ -195,13 +207,13 @@ impl Client {
 
     /// This is a Gateway function to the Maidsafe network. This will help
     /// create a fresh acc for the user in the SAFE-network.
-    pub fn registered<T>(acc_locator: &str,
-                         acc_password: &str,
-                         invitation: &str,
-                         el_handle: Handle,
-                         core_tx: CoreMsgTx<T>,
-                         net_tx: NetworkTx)
-                         -> Result<Client, CoreError>
+    pub fn registered(acc_locator: &str,
+                      acc_password: &str,
+                      invitation: &str,
+                      el_handle: Handle,
+                      core_tx: CoreMsgTx<T>,
+                      net_tx: NetworkTx)
+                      -> Result<Client<T>, CoreError>
         where T: 'static
     {
         Self::registered_impl(acc_locator.as_bytes(),
@@ -215,14 +227,14 @@ impl Client {
 
     /// This is a Gateway function to the Maidsafe network. This will help
     /// create a fresh acc for the user in the SAFE-network.
-    pub fn registered_impl<T>(acc_locator: &[u8],
-                              acc_password: &[u8],
-                              invitation: &str,
-                              el_handle: Handle,
-                              core_tx: CoreMsgTx<T>,
-                              net_tx: NetworkTx,
-                              id_seed: Option<&Seed>)
-                              -> Result<Client, CoreError>
+    pub fn registered_impl(acc_locator: &[u8],
+                           acc_password: &[u8],
+                           invitation: &str,
+                           el_handle: Handle,
+                           core_tx: CoreMsgTx<T>,
+                           net_tx: NetworkTx,
+                           id_seed: Option<&Seed>)
+                           -> Result<Client<T>, CoreError>
         where T: 'static
     {
         trace!("Creating an account.");
@@ -266,10 +278,16 @@ impl Client {
         let digest = sha3_256(&pub_key.0);
         let cm_addr = Authority::ClientManager(XorName(digest));
 
-        let msg_id = MessageId::new();
-        routing.put_mdata(cm_addr, acc_md, msg_id, pub_key)?;
+        let res = sync_loop_fn(|| {
+                                   let msg_id = MessageId::new();
+                                   try_request!(routing.put_mdata(cm_addr,
+                                                                  acc_md.clone(),
+                                                                  msg_id,
+                                                                  pub_key));
+                                   wait_for_response!(routing_rx, Response::PutMData, msg_id)
+                               });
 
-        match wait_for_response!(routing_rx, Response::PutMData, msg_id) {
+        match res {
             Ok(_) => (),
             Err(err) => {
                 warn!("Could not put account to the Network: {:?}", err);
@@ -280,9 +298,7 @@ impl Client {
         create_empty_dir(&mut routing, &routing_rx, cm_addr, &user_root_dir, pub_key)?;
         create_empty_dir(&mut routing, &routing_rx, cm_addr, &config_dir, pub_key)?;
 
-        let net_tx_clone = net_tx.clone();
-        let core_tx_clone = core_tx.clone();
-        let joiner = spawn_routing_thread(routing_rx, core_tx_clone, net_tx_clone);
+        let joiner = spawn_routing_thread(routing_rx, core_tx.clone(), net_tx.clone());
 
         Ok(Self::new(Inner {
                          el_handle: el_handle,
@@ -293,15 +309,17 @@ impl Client {
                          timeout: Duration::from_secs(REQUEST_TIMEOUT_SECS),
                          joiner: joiner,
                          session_packet_version: 0,
+                         net_tx: net_tx,
+                         core_tx: core_tx,
                      }))
     }
 
     /// Login using seeded account
-    pub fn login_with_seed<T>(seed: &str,
-                              el_handle: Handle,
-                              core_tx: CoreMsgTx<T>,
-                              net_tx: NetworkTx)
-                              -> Result<Client, CoreError>
+    pub fn login_with_seed(seed: &str,
+                           el_handle: Handle,
+                           core_tx: CoreMsgTx<T>,
+                           net_tx: NetworkTx)
+                           -> Result<Client<T>, CoreError>
         where T: 'static
     {
         let arr = Self::divide_seed(seed)?;
@@ -310,12 +328,12 @@ impl Client {
 
     /// This is a Gateway function to the Maidsafe network. This will help
     /// login to an already existing account of the user in the SAFE-network.
-    pub fn login<T>(acc_locator: &str,
-                    acc_password: &str,
-                    el_handle: Handle,
-                    core_tx: CoreMsgTx<T>,
-                    net_tx: NetworkTx)
-                    -> Result<Client, CoreError>
+    pub fn login(acc_locator: &str,
+                 acc_password: &str,
+                 el_handle: Handle,
+                 core_tx: CoreMsgTx<T>,
+                 net_tx: NetworkTx)
+                 -> Result<Client<T>, CoreError>
         where T: 'static
     {
         Self::login_impl(acc_locator.as_bytes(),
@@ -325,12 +343,12 @@ impl Client {
                          net_tx)
     }
 
-    fn login_impl<T>(acc_locator: &[u8],
-                     acc_password: &[u8],
-                     el_handle: Handle,
-                     core_tx: CoreMsgTx<T>,
-                     net_tx: NetworkTx)
-                     -> Result<Client, CoreError>
+    fn login_impl(acc_locator: &[u8],
+                  acc_password: &[u8],
+                  el_handle: Handle,
+                  core_tx: CoreMsgTx<T>,
+                  net_tx: NetworkTx)
+                  -> Result<Client<T>, CoreError>
         where T: 'static
     {
         trace!("Attempting to log into an acc.");
@@ -340,21 +358,22 @@ impl Client {
         let acc_loc = Account::generate_network_id(&keyword, &pin)?;
         let user_cred = UserCred::new(password, pin);
 
-        let msg_id = MessageId::new();
         let dst = Authority::NaeManager(acc_loc);
 
         let (acc_content, acc_version) = {
             trace!("Creating throw-away routing getter for account packet.");
             let (mut routing, routing_rx) = setup_routing(None, None)?;
 
-            routing
-                .get_mdata_value(dst,
-                                 acc_loc,
-                                 TYPE_TAG_SESSION_PACKET,
-                                 ACC_LOGIN_ENTRY_KEY.to_owned(),
-                                 msg_id)?;
-
-            match wait_for_response!(routing_rx, Response::GetMDataValue, msg_id) {
+            let res = sync_loop_fn(|| {
+                let msg_id = MessageId::new();
+                try_request!(routing.get_mdata_value(dst,
+                                                     acc_loc,
+                                                     TYPE_TAG_SESSION_PACKET,
+                                                     ACC_LOGIN_ENTRY_KEY.to_owned(),
+                                                     msg_id));
+                wait_for_response!(routing_rx, Response::GetMDataValue, msg_id)
+            });
+            match res {
                 Ok(Value {
                        content,
                        entry_version,
@@ -380,9 +399,7 @@ impl Client {
 
         trace!("Creating an actual routing...");
         let (routing, routing_rx) = setup_routing(Some(id_packet), None)?;
-        let net_tx_clone = net_tx.clone();
-        let core_tx_clone = core_tx.clone();
-        let joiner = spawn_routing_thread(routing_rx, core_tx_clone, net_tx_clone);
+        let joiner = spawn_routing_thread(routing_rx, core_tx.clone(), net_tx.clone());
 
         Ok(Self::new(Inner {
                          el_handle: el_handle,
@@ -393,25 +410,25 @@ impl Client {
                          timeout: Duration::from_secs(REQUEST_TIMEOUT_SECS),
                          joiner: joiner,
                          session_packet_version: acc_version,
+                         net_tx: net_tx,
+                         core_tx: core_tx,
                      }))
     }
 
     /// This is a Gateway function to the Maidsafe network. This will help
     /// apps to authorise using an existing pair of keys.
-    pub fn from_keys<T>(keys: ClientKeys,
-                        owner: sign::PublicKey,
-                        el_handle: Handle,
-                        core_tx: CoreMsgTx<T>,
-                        net_tx: NetworkTx,
-                        config: BootstrapConfig)
-                        -> Result<Client, CoreError>
+    pub fn from_keys(keys: ClientKeys,
+                     owner: sign::PublicKey,
+                     el_handle: Handle,
+                     core_tx: CoreMsgTx<T>,
+                     net_tx: NetworkTx,
+                     config: BootstrapConfig)
+                     -> Result<Client<T>, CoreError>
         where T: 'static
     {
         trace!("Attempting to log into an acc using client keys.");
         let (routing, routing_rx) = setup_routing(Some(keys.clone().into()), Some(config.clone()))?;
-        let net_tx_clone = net_tx.clone();
-        let core_tx_clone = core_tx.clone();
-        let joiner = spawn_routing_thread(routing_rx, core_tx_clone, net_tx_clone);
+        let joiner = spawn_routing_thread(routing_rx, core_tx.clone(), net_tx.clone());
 
         Ok(Self::new(Inner {
                          el_handle: el_handle,
@@ -422,10 +439,12 @@ impl Client {
                          timeout: Duration::from_secs(REQUEST_TIMEOUT_SECS),
                          joiner: joiner,
                          session_packet_version: 0,
+                         net_tx: net_tx,
+                         core_tx: core_tx,
                      }))
     }
 
-    fn new(inner: Inner) -> Self {
+    fn new(inner: Inner<T>) -> Self {
         Client { inner: Rc::new(RefCell::new(inner)) }
     }
 
@@ -434,44 +453,27 @@ impl Client {
         self.inner_mut().timeout = duration;
     }
 
-    #[doc(hidden)]
-    pub fn restart_routing<T>(&self, core_tx: CoreMsgTx<T>, net_tx: NetworkTx)
-        where T: 'static
-    {
+    /// Restart the routing client and reconnect to the network.
+    pub fn restart_routing(&self) -> Result<(), CoreError> {
         let opt_id = match self.inner().client_type {
             ClientType::Registered { ref acc, .. } => Some(acc.maid_keys.clone().into()),
             ClientType::FromKeys { ref keys, .. } => Some(keys.clone().into()),
             ClientType::Unregistered { .. } => None,
         };
 
-        let (routing, routing_rx) = match setup_routing(opt_id,
-                                                        self.inner().client_type.config()) {
-            Ok(elt) => elt,
-            Err(e) => {
-                info!("Could not restart routing (will re-attempt, unless dropped): {:?}",
-                      e);
-                let msg = {
-                    let core_tx = core_tx.clone();
-                    let net_tx = net_tx.clone();
-                    CoreMsg::new(move |client, _| {
-                                     client.restart_routing(core_tx, net_tx);
-                                     None
-                                 })
-                };
-                let _ = core_tx.send(msg);
-                return;
-            }
-        };
+        let (routing, routing_rx) = setup_routing(opt_id, self.inner().client_type.config())?;
 
-        if let Err(e) = net_tx.send(NetworkEvent::Connected) {
-            trace!("Couldn't send: {:?}", e);
-        }
-
-        let joiner = spawn_routing_thread(routing_rx, core_tx, net_tx);
+        let joiner = spawn_routing_thread(routing_rx,
+                                          self.inner().core_tx.clone(),
+                                          self.inner().net_tx.clone());
 
         self.inner_mut().hooks.clear();
         self.inner_mut().routing = routing;
         self.inner_mut().joiner = joiner;
+
+        self.inner().net_tx.send(NetworkEvent::Connected)?;
+
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -481,10 +483,6 @@ impl Client {
         if let Some(hook) = opt {
             let _ = hook.send(event);
         }
-    }
-
-    fn insert_hook(&self, msg_id: MessageId, hook: Complete<CoreEvent>) {
-        let _ = self.inner_mut().hooks.insert(msg_id, hook);
     }
 
     fn divide_seed(seed: &str) -> Result<[&[u8]; SEED_SUBPARTS], CoreError> {
@@ -511,37 +509,27 @@ impl Client {
     pub fn get_idata(&self, name: XorName) -> Box<CoreFuture<ImmutableData>> {
         trace!("GetIData for {:?}", name);
 
-        let (hook, rx, msg_id) = oneshot!(self, CoreEvent::GetIData);
-
-        // Check if the data is in the cache. If it is, return it immediately.
-        // If not, retrieve it from the network and store it in the cache.
-        let rx = {
-            if let Some(data) = self.inner_mut().cache.get_mut(&name) {
-                trace!("ImmutableData found in cache.");
-                let _ = hook.send(CoreEvent::GetIData(Ok(data.clone())));
-                return rx.into_box();
-            }
-
-            let inner = self.inner.clone();
-            rx.map(move |data| {
-                         let _ = inner
-                             .borrow_mut()
-                             .cache
-                             .insert(*data.name(), data.clone());
-                         data
-                     })
-                .into_box()
-        };
-
-        let result = self.routing_mut()
-            .get_idata(Authority::NaeManager(name), name, msg_id);
-        if let Err(err) = result {
-            let _ = hook.send(CoreEvent::GetIData(Err(CoreError::from(err))));
-        } else {
-            self.insert_hook(msg_id, hook);
+        if let Some(data) = self.inner.borrow_mut().cache.get_mut(&name) {
+            trace!("ImmutableData found in cache.");
+            return future::ok(data.clone()).into_box();
         }
 
-        rx
+        let inner = Rc::downgrade(&self.inner);
+        self.send(move |routing, msg_id| {
+                      routing.get_idata(Authority::NaeManager(name), name, msg_id)
+                  })
+            .and_then(|event| match_event!(event, CoreEvent::GetIData))
+            .map(move |data| {
+                if let Some(inner) = inner.upgrade() {
+                    // Put to cache
+                    let _ = inner
+                        .borrow_mut()
+                        .cache
+                        .insert(*data.name(), data.clone());
+                }
+                data
+            })
+            .into_box()
     }
 
     // TODO All these return the same future from all branches. So convert to impl
@@ -551,7 +539,7 @@ impl Client {
     pub fn put_idata(&self, data: ImmutableData) -> Box<CoreFuture<()>> {
         trace!("PutIData for {:?}", data);
 
-        self.mutate(|routing, dst, msg_id| routing.put_idata(dst, data, msg_id))
+        self.send_mutation(move |routing, dst, msg_id| routing.put_idata(dst, data.clone(), msg_id))
     }
 
     /// Put `MutableData` onto the network.
@@ -559,7 +547,9 @@ impl Client {
         trace!("PutMData for {:?}", data);
 
         let requester = fry!(self.public_signing_key());
-        self.mutate(|routing, dst, msg_id| routing.put_mdata(dst, data, msg_id, requester))
+        self.send_mutation(move |routing, dst, msg_id| {
+                               routing.put_mdata(dst, data.clone(), msg_id, requester)
+                           })
     }
 
     /// Mutates `MutableData` entries in bulk.
@@ -571,18 +561,23 @@ impl Client {
         trace!("PutMData for {:?}", name);
 
         let requester = fry!(self.public_signing_key());
-        self.mutate(|routing, dst, msg_id| {
-                        routing.mutate_mdata_entries(dst, name, tag, actions, msg_id, requester)
-                    })
+        self.send_mutation(move |routing, dst, msg_id| {
+                               routing.mutate_mdata_entries(dst,
+                                                            name,
+                                                            tag,
+                                                            actions.clone(),
+                                                            msg_id,
+                                                            requester)
+                           })
     }
 
     /// Get entire `MutableData` from the network.
     pub fn get_mdata(&self, name: XorName, tag: u64) -> Box<CoreFuture<MutableData>> {
         trace!("GetMData for {:?}", name);
 
-        self.get(CoreEvent::GetMData, |routing, msg_id| {
-                routing.get_mdata(Authority::NaeManager(name), name, tag, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.get_mdata(Authority::NaeManager(name), name, tag, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::GetMData))
             .into_box()
     }
@@ -591,9 +586,9 @@ impl Client {
     pub fn get_mdata_shell(&self, name: XorName, tag: u64) -> Box<CoreFuture<MutableData>> {
         trace!("GetMDataShell for {:?}", name);
 
-        self.get(CoreEvent::GetMDataShell, |routing, msg_id| {
-                routing.get_mdata_shell(Authority::NaeManager(name), name, tag, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.get_mdata_shell(Authority::NaeManager(name), name, tag, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::GetMDataShell))
             .into_box()
     }
@@ -602,9 +597,9 @@ impl Client {
     pub fn get_mdata_version(&self, name: XorName, tag: u64) -> Box<CoreFuture<u64>> {
         trace!("GetMDataVersion for {:?}", name);
 
-        self.get(CoreEvent::GetMDataVersion, |routing, msg_id| {
-                routing.get_mdata_version(Authority::NaeManager(name), name, tag, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.get_mdata_version(Authority::NaeManager(name), name, tag, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::GetMDataVersion))
             .into_box()
     }
@@ -616,9 +611,9 @@ impl Client {
                               -> Box<CoreFuture<BTreeMap<Vec<u8>, Value>>> {
         trace!("ListMDataEntries for {:?}", name);
 
-        self.get(CoreEvent::ListMDataEntries, |routing, msg_id| {
-                routing.list_mdata_entries(Authority::NaeManager(name), name, tag, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.list_mdata_entries(Authority::NaeManager(name), name, tag, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::ListMDataEntries))
             .into_box()
     }
@@ -627,9 +622,9 @@ impl Client {
     pub fn list_mdata_keys(&self, name: XorName, tag: u64) -> Box<CoreFuture<BTreeSet<Vec<u8>>>> {
         trace!("ListMDataKeys for {:?}", name);
 
-        self.get(CoreEvent::ListMDataKeys, |routing, msg_id| {
-                routing.list_mdata_keys(Authority::NaeManager(name), name, tag, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.list_mdata_keys(Authority::NaeManager(name), name, tag, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::ListMDataKeys))
             .into_box()
     }
@@ -638,9 +633,9 @@ impl Client {
     pub fn list_mdata_values(&self, name: XorName, tag: u64) -> Box<CoreFuture<Vec<Value>>> {
         trace!("ListMDataValues for {:?}", name);
 
-        self.get(CoreEvent::ListMDataValues, |routing, msg_id| {
-                routing.list_mdata_values(Authority::NaeManager(name), name, tag, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.list_mdata_values(Authority::NaeManager(name), name, tag, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::ListMDataValues))
             .into_box()
     }
@@ -649,9 +644,13 @@ impl Client {
     pub fn get_mdata_value(&self, name: XorName, tag: u64, key: Vec<u8>) -> Box<CoreFuture<Value>> {
         trace!("GetMDataValue for {:?}", name);
 
-        self.get(CoreEvent::GetMDataValue, |routing, msg_id| {
-                routing.get_mdata_value(Authority::NaeManager(name), name, tag, key, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.get_mdata_value(Authority::NaeManager(name),
+                                              name,
+                                              tag,
+                                              key.clone(),
+                                              msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::GetMDataValue))
             .into_box()
     }
@@ -660,18 +659,10 @@ impl Client {
     pub fn get_account_info(&self) -> Box<CoreFuture<AccountInfo>> {
         trace!("Account info GET issued.");
 
-        let (hook, rx, msg_id) = oneshot!(self, CoreEvent::GetAccountInfo);
-
-        let dst = fry!(self.inner().client_type.cm_addr().map(|a| *a));
-        let result = self.routing_mut().get_account_info(dst, msg_id);
-
-        if let Err(e) = result {
-            let _ = hook.send(CoreEvent::GetAccountInfo(Err(From::from(e))));
-        } else {
-            self.insert_hook(msg_id, hook);
-        }
-
-        rx
+        let dst = fry!(self.cm_addr());
+        self.send(move |routing, msg_id| routing.get_account_info(dst, msg_id))
+            .and_then(|event| match_event!(event, CoreEvent::GetAccountInfo))
+            .into_box()
     }
 
     /// Returns a list of permissions in `MutableData` stored on the network
@@ -681,9 +672,9 @@ impl Client {
                                   -> Box<CoreFuture<BTreeMap<User, PermissionSet>>> {
         trace!("ListMDataPermissions for {:?}", name);
 
-        self.get(CoreEvent::ListMDataPermissions, |routing, msg_id| {
-                routing.list_mdata_permissions(Authority::NaeManager(name), name, tag, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      routing.list_mdata_permissions(Authority::NaeManager(name), name, tag, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::ListMDataPermissions))
             .into_box()
     }
@@ -696,10 +687,10 @@ impl Client {
                                        -> Box<CoreFuture<PermissionSet>> {
         trace!("ListMDataUserPermissions for {:?}", name);
 
-        self.get(CoreEvent::ListMDataUserPermissions, |routing, msg_id| {
-                let dst = Authority::NaeManager(name);
-                routing.list_mdata_user_permissions(dst, name, tag, user, msg_id)
-            })
+        self.send(move |routing, msg_id| {
+                      let dst = Authority::NaeManager(name);
+                      routing.list_mdata_user_permissions(dst, name, tag, user, msg_id)
+                  })
             .and_then(|event| match_event!(event, CoreEvent::ListMDataUserPermissions))
             .into_box()
     }
@@ -715,7 +706,7 @@ impl Client {
         trace!("SetMDataUserPermissions for {:?}", name);
 
         let requester = fry!(self.public_signing_key());
-        self.mutate(|routing, dst, msg_id| {
+        self.send_mutation(move |routing, dst, msg_id| {
             routing.set_mdata_user_permissions(dst,
                                                name,
                                                tag,
@@ -737,7 +728,7 @@ impl Client {
         trace!("DelMDataUserPermissions for {:?}", name);
 
         let requester = fry!(self.public_signing_key());
-        self.mutate(|routing, dst, msg_id| {
+        self.send_mutation(move |routing, dst, msg_id| {
             routing.del_mdata_user_permissions(dst, name, tag, user, version, msg_id, requester)
         })
     }
@@ -751,24 +742,22 @@ impl Client {
                               -> Box<CoreFuture<()>> {
         trace!("ChangeMDataOwner for {:?}", name);
 
-        self.mutate(|routing, dst, msg_id| {
-                        routing.change_mdata_owner(dst,
-                                                   name,
-                                                   tag,
-                                                   btree_set![new_owner],
-                                                   version,
-                                                   msg_id)
-                    })
+        self.send_mutation(move |routing, dst, msg_id| {
+                               routing.change_mdata_owner(dst,
+                                                          name,
+                                                          tag,
+                                                          btree_set![new_owner],
+                                                          version,
+                                                          msg_id)
+                           })
     }
 
     /// Fetches a list of authorised keys and version in MaidManager
     pub fn list_auth_keys_and_version(&self) -> Box<CoreFuture<(BTreeSet<sign::PublicKey>, u64)>> {
         trace!("ListAuthKeysAndVersion");
 
-        let dst = fry!(self.inner().client_type.cm_addr().map(|a| *a));
-
-        self.get(CoreEvent::ListAuthKeysAndVersion,
-                 |routing, msg_id| routing.list_auth_keys_and_version(dst, msg_id))
+        let dst = fry!(self.cm_addr());
+        self.send(move |routing, msg_id| routing.list_auth_keys_and_version(dst, msg_id))
             .and_then(|event| match_event!(event, CoreEvent::ListAuthKeysAndVersion))
             .into_box()
     }
@@ -777,14 +766,18 @@ impl Client {
     pub fn ins_auth_key(&self, key: sign::PublicKey, version: u64) -> Box<CoreFuture<()>> {
         trace!("InsAuthKey ({:?})", key);
 
-        self.mutate(|routing, dst, msg_id| routing.ins_auth_key(dst, key, version, msg_id))
+        self.send_mutation(move |routing, dst, msg_id| {
+                               routing.ins_auth_key(dst, key, version, msg_id)
+                           })
     }
 
     /// Removes an authorised key from MaidManager
     pub fn del_auth_key(&self, key: sign::PublicKey, version: u64) -> Box<CoreFuture<()>> {
         trace!("DelAuthKey ({:?})", key);
 
-        self.mutate(|routing, dst, msg_id| routing.del_auth_key(dst, key, version, msg_id))
+        self.send_mutation(move |routing, dst, msg_id| {
+                               routing.del_auth_key(dst, key, version, msg_id)
+                           })
     }
 
     /// Create an entry for the Root Directory ID for the user into the account
@@ -912,106 +905,181 @@ impl Client {
         self.mutate_mdata_entries(data_name, TYPE_TAG_SESSION_PACKET, actions)
     }
 
-    /// Generic GET request
-    fn get<T, F, G>(&self, err_event: F, req: G) -> Box<CoreFuture<CoreEvent>>
-        where F: FnOnce(Result<T, CoreError>) -> CoreEvent,
-              G: FnOnce(&mut Routing, MessageId) -> Result<(), InterfaceError>
+    /// Sends a request and returns a future that resolves to the response.
+    fn send<F>(&self, req: F) -> Box<CoreFuture<CoreEvent>>
+        where F: Fn(&mut Routing, MessageId) -> Result<(), InterfaceError> + 'static
     {
-        let msg_id = MessageId::new();
-        let (hook, oneshot) = futures::oneshot();
+        let inner = Rc::downgrade(&self.inner);
+        let func = move |_| if let Some(inner) = inner.upgrade() {
+            let msg_id = MessageId::new();
+            if let Err(error) = req(&mut inner.borrow_mut().routing, msg_id) {
+                return future::err(CoreError::from(error)).into_box();
+            }
 
-        let fut = oneshot.map_err(|_| CoreError::OperationAborted);
-        let rx = self.timeout(msg_id, fut);
+            let (hook, rx) = oneshot::channel();
+            let _ = inner.borrow_mut().hooks.insert(msg_id, hook);
 
-        let result = req(&mut *self.routing_mut(), msg_id);
-
-        if let Err(err) = result {
-            let _ = hook.send(err_event(Err(CoreError::from(err))));
+            let rx = rx.map_err(|_| CoreError::OperationAborted);
+            let rx = setup_timeout_and_retry_delay(&inner, msg_id, rx);
+            let rx = rx.map(|event| if let CoreEvent::RateLimitExceeded = event {
+                                Loop::Continue(())
+                            } else {
+                                Loop::Break(event)
+                            });
+            rx.into_box()
         } else {
-            self.insert_hook(msg_id, hook);
-        }
+            future::err(CoreError::OperationAborted).into_box()
+        };
 
-        rx
+        future::loop_fn((), func).into_box()
     }
 
-    /// Generic mutation request
-    fn mutate<F>(&self, req: F) -> Box<CoreFuture<()>>
-        where F: FnOnce(&mut Routing, Authority<XorName>, MessageId) -> Result<(), InterfaceError>
+    /// Sends a mutation request.
+    fn send_mutation<F>(&self, req: F) -> Box<CoreFuture<()>>
+        where F: Fn(&mut Routing, Authority<XorName>, MessageId) -> Result<(), InterfaceError>
+                 + 'static
     {
-        let dst = fry!(self.inner().client_type.cm_addr().map(|a| *a));
+        let dst = fry!(self.cm_addr());
 
-        self.get(CoreEvent::Mutation,
-                 |routing, msg_id| req(routing, dst, msg_id))
+        self.send(move |routing, msg_id| req(routing, dst, msg_id))
             .and_then(|event| match_event!(event, CoreEvent::Mutation))
             .into_box()
     }
 
-    fn timeout<F, T>(&self, msg_id: MessageId, future: F) -> Box<CoreFuture<T>>
-        where F: Future<Item = T, Error = CoreError> + 'static,
-              T: 'static
-    {
-        let duration = self.inner().timeout;
-        let timeout = match Timeout::new(duration, &self.inner().el_handle) {
-            Ok(timeout) => timeout,
-            Err(err) => {
-                return err!(CoreError::Unexpected(format!("Timeout create error: {:?}", err)))
-            }
-        };
-
-        let client = self.clone();
-        let timeout = timeout.then(move |result| -> Result<T, _> {
-            let _ = client.inner_mut().hooks.remove(&msg_id);
-
-            match result {
-                Ok(()) => Err(CoreError::RequestTimeout),
-                Err(err) => Err(CoreError::Unexpected(format!("Timeout fire error {:?}", err))),
-            }
-        });
-
-        future
-            .select(timeout)
-            .then(|result| match result {
-                      Ok((a, _)) => Ok(a),
-                      Err((a, _)) => Err(a),
-                  })
-            .into_box()
-    }
-
-    fn routing_mut(&self) -> RefMut<Routing> {
-        RefMut::map(self.inner.borrow_mut(), |i| &mut i.routing)
-    }
-
-    fn inner(&self) -> Ref<Inner> {
+    fn inner(&self) -> Ref<Inner<T>> {
         self.inner.borrow()
     }
 
-    fn inner_mut(&self) -> RefMut<Inner> {
+    fn inner_mut(&self) -> RefMut<Inner<T>> {
         self.inner.borrow_mut()
+    }
+
+    fn cm_addr(&self) -> Result<Authority<XorName>, CoreError> {
+        self.inner().client_type.cm_addr().map(|a| *a)
     }
 }
 
 #[cfg(any(all(test, feature = "use-mock-routing"),
           all(feature = "testing", feature = "use-mock-routing")))]
-impl Client {
+impl<T: 'static> Client<T> {
     #[doc(hidden)]
     pub fn set_network_limits(&self, max_ops_count: Option<u64>) {
-        self.routing_mut().set_network_limits(max_ops_count);
+        self.inner
+            .borrow_mut()
+            .routing
+            .set_network_limits(max_ops_count);
     }
 
     #[doc(hidden)]
     pub fn simulate_network_disconnect(&self) {
-        self.routing_mut().simulate_disconnect();
+        self.inner.borrow_mut().routing.simulate_disconnect();
     }
 
     #[doc(hidden)]
     pub fn set_simulate_timeout(&self, enabled: bool) {
-        self.routing_mut().set_simulate_timeout(enabled);
+        self.inner
+            .borrow_mut()
+            .routing
+            .set_simulate_timeout(enabled);
+    }
+
+    #[doc(hidden)]
+    pub fn simulate_rate_limit_errors(&self, count: usize) {
+        self.inner
+            .borrow_mut()
+            .routing
+            .simulate_rate_limit_errors(count)
     }
 }
 
-impl fmt::Debug for Client {
+impl<T> fmt::Debug for Client<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Client")
+    }
+}
+
+fn setup_timeout_and_retry_delay<T, F>(inner: &Rc<RefCell<Inner<T>>>,
+                                       msg_id: MessageId,
+                                       future: F)
+                                       -> Box<CoreFuture<CoreEvent>>
+    where F: Future<Item = CoreEvent, Error = CoreError> + 'static,
+          T: 'static
+{
+    // Delay after rate limit exceeded.
+    let inner_weak = Rc::downgrade(inner);
+    let future = future.and_then(move |event| {
+        if let CoreEvent::RateLimitExceeded = event {
+            if let Some(inner) = inner_weak.upgrade() {
+                let delay = Duration::from_millis(RETRY_DELAY_MS);
+                let fut = timeout(delay, &inner.borrow().el_handle).or_else(move |_| Ok(event));
+                return Either::A(fut);
+            }
+        }
+
+        Either::B(future::ok(event))
+    });
+
+    // Fail if no response received within the timeout.
+    let duration = inner.borrow().timeout;
+    let inner_weak = Rc::downgrade(inner);
+    let timeout =
+        timeout(duration, &inner.borrow().el_handle).then(move |result| {
+            if let Some(inner) = inner_weak.upgrade() {
+                let _ = inner.borrow_mut().hooks.remove(&msg_id);
+            }
+
+            result
+        });
+
+    future
+        .select(timeout)
+        .then(|result| match result {
+                  Ok((a, _)) => Ok(a),
+                  Err((a, _)) => Err(a),
+              })
+        .into_box()
+}
+
+// Create a future that resolves into `CoreError::RequestTimeout` after the given time interval.
+fn timeout(duration: Duration, handle: &Handle) -> TimeoutFuture {
+    let timeout = match Timeout::new(duration, handle) {
+        Ok(timeout) => timeout,
+        Err(err) => {
+            return Either::A(future::err(CoreError::Unexpected(format!("Timeout create error: {:?}",
+                                                                       err))));
+        }
+    };
+
+    fn map_result(result: io::Result<()>) -> Result<CoreEvent, CoreError> {
+        match result {
+            Ok(()) => Err(CoreError::RequestTimeout),
+            Err(err) => Err(CoreError::Unexpected(format!("Timeout fire error {:?}", err))),
+        }
+    }
+
+    Either::B(timeout.then(map_result))
+}
+
+
+type TimeoutFuture = Either<FutureResult<CoreEvent, CoreError>,
+                            Then<Timeout,
+                                 Result<CoreEvent, CoreError>,
+                                 fn(io::Result<()>) -> Result<CoreEvent, CoreError>>>;
+
+enum SyncLoop<T> {
+    Break(Result<T, CoreError>),
+    Continue,
+}
+
+// Keep calling the given function until it returns `SyncLoop::Break(_)`.
+fn sync_loop_fn<F, T>(mut f: F) -> Result<T, CoreError>
+    where F: FnMut() -> SyncLoop<T>
+{
+    loop {
+        match f() {
+            SyncLoop::Break(res) => return res,
+            SyncLoop::Continue => (),
+        }
     }
 }
 
@@ -1178,6 +1246,10 @@ fn setup_routing(full_id: Option<FullId>,
     trace!("Waiting to get connected to the Network...");
     match routing_rx.recv_timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS)) {
         Ok(Event::Connected) => (),
+        Ok(Event::Terminate) => {
+            // TODO: Consider adding a separate error type for this
+            return Err(CoreError::from("Could not connect to the SAFE Network".to_string()));
+        }
         Err(RecvTimeoutError::Timeout) => {
             return Err(CoreError::RequestTimeout);
         }
@@ -1215,18 +1287,17 @@ fn create_empty_dir(routing: &mut Routing,
                                   BTreeMap::new(),
                                   btree_set![owner_key])?;
 
-    let msg_id = MessageId::new();
-    routing.put_mdata(dst, dir_md, msg_id, owner_key)?;
+    let res =
+        sync_loop_fn(|| {
+                         let msg_id = MessageId::new();
+                         try_request!(routing.put_mdata(dst, dir_md.clone(), msg_id, owner_key));
+                         wait_for_response!(routing_rx, Response::PutMData, msg_id)
+                     });
 
-    match wait_for_response!(routing_rx, Response::PutMData, msg_id) {
-        Ok(_) => (),
-        Err(err) => {
-            warn!("Could not put directory to the Network: {:?}", err);
-            return Err(err);
-        }
-    }
-
-    Ok(())
+    res.map_err(|err| {
+                    warn!("Could not put directory to the Network: {:?}", err);
+                    err
+                })
 }
 
 #[cfg(test)]
@@ -1248,20 +1319,20 @@ mod tests {
         let invalid_seed = String::from("123");
         {
             let el = unwrap!(Core::new());
-            let (core_tx, _) = mpsc::unbounded();
+            let (core_tx, _): (CoreMsgTx<()>, _) = mpsc::unbounded();
             let (net_tx, _) = mpsc::unbounded();
 
-            match Client::registered_with_seed::<()>(&invalid_seed, el.handle(), core_tx, net_tx) {
+            match Client::registered_with_seed(&invalid_seed, el.handle(), core_tx, net_tx) {
                 Err(CoreError::Unexpected(_)) => (),
                 _ => panic!("Expected a failure"),
             }
         }
         {
             let el = unwrap!(Core::new());
-            let (core_tx, _) = mpsc::unbounded();
+            let (core_tx, _): (CoreMsgTx<()>, _) = mpsc::unbounded();
             let (net_tx, _) = mpsc::unbounded();
 
-            match Client::login_with_seed::<()>(&invalid_seed, el.handle(), core_tx, net_tx) {
+            match Client::login_with_seed(&invalid_seed, el.handle(), core_tx, net_tx) {
                 Err(CoreError::Unexpected(_)) => (),
                 _ => panic!("Expected a failure"),
             }
@@ -1340,7 +1411,7 @@ mod tests {
     #[test]
     fn registered_client() {
         let el = unwrap!(Core::new());
-        let (core_tx, _) = mpsc::unbounded();
+        let (core_tx, _): (CoreMsgTx<()>, _) = mpsc::unbounded();
         let (net_tx, _) = mpsc::unbounded();
 
         let sec_0 = unwrap!(utils::generate_random_string(10));
@@ -1348,12 +1419,12 @@ mod tests {
         let inv = unwrap!(utils::generate_random_string(10));
 
         // Account creation for the 1st time - should succeed
-        let _ = unwrap!(Client::registered::<()>(&sec_0,
-                                                 &sec_1,
-                                                 &inv,
-                                                 el.handle(),
-                                                 core_tx.clone(),
-                                                 net_tx.clone()));
+        let _ = unwrap!(Client::registered(&sec_0,
+                                           &sec_1,
+                                           &inv,
+                                           el.handle(),
+                                           core_tx.clone(),
+                                           net_tx.clone()));
 
         // Account creation - same secrets - should fail
         match Client::registered(&sec_0, &sec_1, &inv, el.handle(), core_tx, net_tx) {
@@ -1436,91 +1507,6 @@ mod tests {
                      });
     }
 
-    /*
-    #[test]
-    fn put_or_reclaim_structured_data() {
-        random_client(|client| {
-            let client2 = client.clone();
-            let client3 = client.clone();
-            let client4 = client.clone();
-
-            let owner_keys = vec![unwrap!(client.public_signing_key())];
-            let owner_keys2 = owner_keys.clone();
-            let owner_keys3 = owner_keys.clone();
-            let owner_keys4 = owner_keys.clone();
-
-            let sign_sk = unwrap!(client.secret_signing_key());
-            let sign_sk2 = sign_sk.clone();
-            let sign_sk3 = sign_sk.clone();
-            let sign_sk4 = sign_sk.clone();
-
-            let tag = ::UNVERSIONED_STRUCT_DATA_TYPE_TAG;
-            let name = rand::random();
-            let value = unwrap!(utils::generate_random_vector(10));
-
-            // PUT the data to the network.
-            let data = unwrap!(StructuredData::new(tag,
-                                                   name,
-                                                   0,
-                                                   value,
-                                                   owner_keys,
-                                                   vec![],
-                                                   Some(&sign_sk)));
-
-            client.put(Data::Structured(data), None)
-                .then(move |result| {
-                    unwrap!(result);
-
-                    // DELETE it.
-                    let data = unwrap!(StructuredData::new(tag,
-                                                           name,
-                                                           1,
-                                                           vec![],
-                                                           vec![],
-                                                           owner_keys2,
-                                                           Some(&sign_sk2)));
-                    client2.delete(Data::Structured(data), None)
-                })
-                .then(move |result| {
-                    unwrap!(result);
-
-                    // Try to PUT new data under the same name. Should fail.
-                    let value = unwrap!(utils::generate_random_vector(10));
-                    let data = unwrap!(StructuredData::new(tag,
-                                                           name,
-                                                           0,
-                                                           value,
-                                                           owner_keys3,
-                                                           vec![],
-                                                           Some(&sign_sk3)));
-                    client3.put(Data::Structured(data), None)
-                })
-                .then(move |result| {
-                    match result {
-                        Err(CoreError::MutationFailure {
-                            reason: MutationError::InvalidSuccessor, ..
-                        }) => (),
-                        Ok(()) => panic!("Unexpected success"),
-                        Err(err) => panic!("{:?}", err),
-                    }
-
-                    // Not try again, but using `put_or_reclaim`. Should succeed.
-                    let value = unwrap!(utils::generate_random_vector(10));
-                    let data = unwrap!(StructuredData::new(tag,
-                                                           name,
-                                                           0,
-                                                           value,
-                                                           owner_keys4,
-                                                           vec![],
-                                                           Some(&sign_sk4)));
-                    client4.put_recover(Data::Structured(data), None, sign_sk4)
-                })
-                .map_err(|err| panic!("{:?}", err))
-                .map(|ver| assert!(ver != 0))
-        })
-    }
-*/
-
     #[cfg(feature = "use-mock-routing")]
     #[test]
     fn restart_routing() {
@@ -1548,6 +1534,7 @@ mod tests {
         random_client_with_net_obs(move |net_event| unwrap!(tx.send(net_event)),
                                    move |client| {
                                        client.simulate_network_disconnect();
+                                       unwrap!(client.restart_routing());
                                        keep_alive
                                    });
     }
@@ -1583,6 +1570,33 @@ mod tests {
                           Ok(_) => panic!("Unexpected success"),
                           Err(CoreError::RequestTimeout) => Ok::<_, CoreError>(()),
                           Err(err) => panic!("Unexpected {:?}", err),
+                      })
+        })
+    }
+
+    // Test resilience against rate limit errors - the client should keep retrying
+    // any request that fails on exceeded rate limit until it succeeds.
+    #[cfg(feature = "use-mock-routing")]
+    #[test]
+    fn rate_limit_errors() {
+        random_client(|client| {
+            let client2 = client.clone();
+
+            let data = ImmutableData::new(unwrap!(utils::generate_random_vector(10)));
+            let data_name = *data.name();
+
+            client.simulate_rate_limit_errors(2);
+            client
+                .put_idata(data.clone())
+                .then(move |result| {
+                          unwrap!(result);
+                          client2.simulate_rate_limit_errors(1);
+                          client2.get_idata(data_name)
+                      })
+                .then(move |result| {
+                          let got_data = unwrap!(result);
+                          assert_eq!(got_data, data);
+                          Ok::<_, CoreError>(())
                       })
         })
     }
