@@ -20,10 +20,10 @@
 use App;
 use errors::AppError;
 use ffi::helper::send_sync;
+use ffi::object_cache::MDataEntriesHandle;
 use ffi_utils::{FFI_RESULT_OK, FfiResult, OpaqueCtx, SafePtr, catch_unwind_cb,
                 vec_clone_from_raw_parts};
 use ffi_utils::callback::Callback;
-use object_cache::MDataEntriesHandle;
 use routing::{ClientError, Value};
 use safe_core::CoreError;
 use std::collections::BTreeMap;
@@ -225,11 +225,11 @@ mod tests {
     use ffi::mutable_data::*;
     use ffi::mutable_data::entry_actions::*;
     use ffi::mutable_data::permissions::*;
+    use ffi::object_cache::MDataEntryActionsHandle;
     use ffi_utils::test_utils::{call_0, call_1, call_vec, send_via_user_data, sender_as_user_data};
     use ffi_utils::vec_clone_from_raw_parts;
-    use object_cache::MDataEntryActionsHandle;
     use routing::{Action, PermissionSet, Value};
-    use safe_core::ipc::resp::MDataValue;
+    use safe_core::ipc::resp::{MDataKey, MDataValue};
     use safe_core::utils;
     use std::collections::BTreeMap;
     use std::os::raw::c_void;
@@ -446,7 +446,7 @@ mod tests {
         };
 
         // Create an empty public mdata
-        let md_info: MDataInfo =
+        let md_info: NativeMDataInfo =
             unsafe { unwrap!(call_1(|ud, cb| mdata_info_random_public(10_000, ud, cb))) };
         let md_info = md_info.into_repr_c();
 
@@ -457,7 +457,7 @@ mod tests {
         };
 
         // Get the keys handle, make sure number of keys is zero
-        let keys: Vec<MDataKey> =
+        let keys: Vec<NativeMDataKey> =
             unsafe { unwrap!(call_vec(|ud, cb| mdata_list_keys(&app, &md_info, ud, cb))) };
 
         assert_eq!(keys.len(), 0);
