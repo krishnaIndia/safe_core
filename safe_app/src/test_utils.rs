@@ -17,13 +17,11 @@
 
 use super::{App, AppContext};
 use super::errors::AppError;
-use ffi_utils::catch_unwind_error_code;
 use futures::{Future, IntoFuture};
 use safe_authenticator::test_utils as authenticator;
 use safe_core::{Client, FutureExt, utils};
-use safe_core::ffi::ipc::req::ContainerPermissions as FfiContainerPermissions;
 use safe_core::ipc::AppExchangeInfo;
-use safe_core::ipc::req::{AuthReq, ContainerPermissions, containers_from_repr_c};
+use safe_core::ipc::req::{AuthReq, ContainerPermissions};
 use std::collections::HashMap;
 use std::sync::mpsc;
 
@@ -116,37 +114,4 @@ pub fn create_app_with_access(access_info: HashMap<String, ContainerPermissions>
     ));
 
     unwrap!(App::registered(app_id, auth_granted, || ()))
-}
-
-/// Creates a random app instance for testing.
-#[no_mangle]
-#[allow(unsafe_code)]
-#[cfg_attr(feature = "cargo-clippy", allow(not_unsafe_ptr_arg_deref))]
-pub extern "C" fn test_create_app(o_app: *mut *mut App) -> i32 {
-    catch_unwind_error_code(|| -> Result<(), AppError> {
-        let app = create_app();
-        unsafe {
-            *o_app = Box::into_raw(Box::new(app));
-        }
-        Ok(())
-    })
-}
-
-/// Create a random app instance for testing, with access to containers.
-#[no_mangle]
-#[allow(unsafe_code)]
-#[cfg_attr(feature = "cargo-clippy", allow(not_unsafe_ptr_arg_deref))]
-pub extern "C" fn test_create_app_with_access(
-    access_info: *const FfiContainerPermissions,
-    access_info_len: usize,
-    o_app: *mut *mut App,
-) -> i32 {
-    catch_unwind_error_code(|| -> Result<(), AppError> {
-        let containers = unsafe { containers_from_repr_c(access_info, access_info_len)? };
-        let app = create_app_with_access(containers);
-        unsafe {
-            *o_app = Box::into_raw(Box::new(app));
-        }
-        Ok(())
-    })
 }

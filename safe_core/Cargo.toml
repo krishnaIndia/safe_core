@@ -38,13 +38,14 @@ serde_json = "~1.0.2"
 
 [build-dependencies]
 ffi_utils = { path = "../ffi_utils", version = "~0.3.0" }
-routing = "~0.33.1"
+routing = "~0.33.2"
 rust_sodium = "~0.5.0"
 unwrap = "~1.1.0"
 
 [features]
 use-mock-routing = []
 testing = []
+bindings = []
 
 [[example]]
 bench = false
