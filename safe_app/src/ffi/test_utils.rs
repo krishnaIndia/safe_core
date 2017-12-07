@@ -15,43 +15,43 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
-use App;
-use errors::AppError;
-use ffi_utils::catch_unwind_error_code;
-use safe_core::ffi::ipc::req::ContainerPermissions;
-use safe_core::ipc::req::containers_from_repr_c;
-use test_utils::{create_app, create_app_with_access};
+// #![allow(unsafe_code)]
+
+// use App;
+// use errors::AppError;
+// use ffi_utils::catch_unwind_error_code;
+// use safe_core::ffi::ipc::req::ContainerPermissions;
+// use safe_core::ipc::req::containers_from_repr_c;
+// use test_utils::{create_app, create_app_with_access};
 
 
-/// Creates a random app instance for testing.
-#[no_mangle]
-#[allow(unsafe_code)]
-#[cfg_attr(feature = "cargo-clippy", allow(not_unsafe_ptr_arg_deref))]
-pub extern "C" fn test_create_app(o_app: *mut *mut App) -> i32 {
-    catch_unwind_error_code(|| -> Result<(), AppError> {
-        let app = create_app();
-        unsafe {
-            *o_app = Box::into_raw(Box::new(app));
-        }
-        Ok(())
-    })
-}
+// /// Creates a random app instance for testing.
+// #[no_mangle]
+// #[cfg_attr(feature = "cargo-clippy", allow(not_unsafe_ptr_arg_deref))]
+// pub extern "C" fn test_create_app(o_app: *mut *mut App) -> i32 {
+//     catch_unwind_error_code(|| -> Result<(), AppError> {
+//         let app = create_app();
+//         unsafe {
+//             *o_app = Box::into_raw(Box::new(app));
+//         }
+//         Ok(())
+//     })
+// }
 
-/// Create a random app instance for testing, with access to containers.
-#[no_mangle]
-#[allow(unsafe_code)]
-#[cfg_attr(feature = "cargo-clippy", allow(not_unsafe_ptr_arg_deref))]
-pub extern "C" fn test_create_app_with_access(
-    access_info_ptr: *const ContainerPermissions,
-    access_info_len: usize,
-    o_app: *mut *mut App,
-) -> i32 {
-    catch_unwind_error_code(|| -> Result<(), AppError> {
-        let containers = unsafe { containers_from_repr_c(access_info_ptr, access_info_len)? };
-        let app = create_app_with_access(containers);
-        unsafe {
-            *o_app = Box::into_raw(Box::new(app));
-        }
-        Ok(())
-    })
-}
+// /// Create a random app instance for testing, with access to containers.
+// #[no_mangle]
+// #[cfg_attr(feature = "cargo-clippy", allow(not_unsafe_ptr_arg_deref))]
+// pub extern "C" fn test_create_app_with_access(
+//     access_info_ptr: *const ContainerPermissions,
+//     access_info_len: usize,
+//     o_app: *mut *mut App,
+// ) -> i32 {
+//     catch_unwind_error_code(|| -> Result<(), AppError> {
+//         let containers = unsafe { containers_from_repr_c(access_info_ptr, access_info_len)? };
+//         let app = create_app_with_access(containers);
+//         unsafe {
+//             *o_app = Box::into_raw(Box::new(app));
+//         }
+//         Ok(())
+//     })
+// }
