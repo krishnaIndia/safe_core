@@ -91,8 +91,15 @@ mod tests;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 
+#[cfg(feature = "bindings-jni")]
+extern crate jni;
+#[cfg(feature = "bindings-jni")]
+mod bindings_jni;
+
 pub use self::errors::*;
 use self::object_cache::ObjectCache;
+#[cfg(feature = "bindings-jni")]
+pub use bindings_jni::*;
 use futures::{Future, future};
 use futures::stream::Stream;
 use futures::sync::mpsc as futures_mpsc;
