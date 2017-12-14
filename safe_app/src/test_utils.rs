@@ -21,7 +21,7 @@ use futures::{Future, IntoFuture};
 use safe_authenticator::test_utils as authenticator;
 use safe_core::{Client, FutureExt, utils};
 use safe_core::ipc::AppExchangeInfo;
-use safe_core::ipc::req::{AuthReq, ContainerPermissions};
+use safe_core::ipc::req::{AuthReq as NativeAuthReq, ContainerPermissions};
 use std::collections::HashMap;
 use std::sync::mpsc;
 
@@ -78,40 +78,52 @@ where
     unwrap!(unwrap!(rx.recv()))
 }
 
-/// Create registered app.
+/// Create a random app
 pub fn create_app() -> App {
-    let auth = authenticator::create_account_and_login();
-
-    let app_info = gen_app_exchange_info();
-    let app_id = app_info.id.clone();
-
-    let auth_granted = unwrap!(authenticator::register_app(
-        &auth,
-        &AuthReq {
-            app: app_info,
-            app_container: false,
-            containers: HashMap::new(),
-        },
-    ));
-
-    unwrap!(App::registered(app_id, auth_granted, || ()))
+    create_app_by_req(&create_random_auth_req())
 }
 
-/// Create app and grant it access to the specified containers.
-pub fn create_app_with_access(access_info: HashMap<String, ContainerPermissions>) -> App {
+/// Create a random app given an app authorisation request
+pub fn create_app_by_req(auth_req: &NativeAuthReq) -> App {
     let auth = authenticator::create_account_and_login();
+    let auth_granted = unwrap!(authenticator::register_app(&auth, auth_req));
+    unwrap!(App::registered(
+        auth_req.app.id.clone(),
+        auth_granted,
+        || (),
+    ))
+}
 
-    let app_info = gen_app_exchange_info();
-    let app_id = app_info.id.clone();
+/// Create an app authorisation request with optional app id and access info.
+pub fn create_auth_req(
+    app_id: Option<String>,
+    access_info: Option<HashMap<String, ContainerPermissions>>,
+) -> NativeAuthReq {
+    let mut app_info = gen_app_exchange_info();
+    if let Some(app_id) = app_id {
+        app_info.id = app_id;
+    }
 
-    let auth_granted = unwrap!(authenticator::register_app(
-        &auth,
-        &AuthReq {
-            app: app_info,
-            app_container: true,
-            containers: access_info,
-        },
-    ));
+    let (app_container, containers) = match access_info {
+        Some(access_info) => (true, access_info),
+        None => (false, HashMap::new()),
+    };
 
-    unwrap!(App::registered(app_id, auth_granted, || ()))
+    NativeAuthReq {
+        app: app_info,
+        app_container,
+        containers,
+    }
+}
+
+/// Create registered app with a random id.
+pub fn create_random_auth_req() -> NativeAuthReq {
+    create_auth_req(None, None)
+}
+
+/// Create registered app with a random id and grant it access to the specified containers.
+pub fn create_auth_req_with_access(
+    access_info: HashMap<String, ContainerPermissions>,
+) -> NativeAuthReq {
+    create_auth_req(None, Some(access_info))
 }
