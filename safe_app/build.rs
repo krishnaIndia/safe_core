@@ -18,17 +18,147 @@
 //! Build script for generating C header files from FFI modules.
 
 extern crate ffi_utils;
+extern crate rust_sodium;
+extern crate routing;
+extern crate safe_bindgen;
 #[macro_use]
 extern crate unwrap;
 
-static HEADER_NAME: &'static str = "safe_app";
-static HEADER_DIRECTORY: &'static str = "../auto-gen/c-include/";
-static ROOT_FILE: &'static str = "src/lib.rs";
+use routing::XOR_NAME_LEN;
+use rust_sodium::crypto::{box_, secretbox, sign};
+use safe_bindgen::{Bindgen, FilterMode, LangCSharp, LangJava};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::path::Path;
 
 fn main() {
+    if env::var("CARGO_FEATURE_BINDINGS").is_err() {
+        return;
+    }
+
+    gen_bindings_c();
+    gen_bindings_csharp();
+    gen_bindings_java();
+}
+
+fn gen_bindings_c() {
     unwrap!(ffi_utils::header_gen::gen_headers(
-        HEADER_NAME,
-        HEADER_DIRECTORY,
-        ROOT_FILE,
+        &unwrap!(env::var("CARGO_PKG_NAME")),
+        "../bindings/c/gen/",
+        "src/lib.rs",
     ));
+}
+
+fn gen_bindings_java() {
+    let target_dir = Path::new("../bindings/java/safe_app");
+
+    let mut type_map = HashMap::new();
+    type_map.insert("XorNameArray", "byte[]");
+    type_map.insert("SignSecretKey", "byte[]");
+    type_map.insert("SignPublicKey", "byte[]");
+    type_map.insert("SymSecretKey", "byte[]");
+    type_map.insert("SymNonce", "byte[]");
+    type_map.insert("AsymPublicKey", "byte[]");
+    type_map.insert("AsymSecretKey", "byte[]");
+    type_map.insert("AsymNonce", "byte[]");
+    type_map.insert("CipherOptHandle", "long");
+    type_map.insert("EncryptPubKeyHandle", "long");
+    type_map.insert("EncryptSecKeyHandle", "long");
+    type_map.insert("MDataEntriesHandle", "long");
+    type_map.insert("MDataEntryActionsHandle", "long");
+    type_map.insert("MDataPermissionsHandle", "long");
+    type_map.insert("SelfEncryptorReaderHandle", "long");
+    type_map.insert("SelfEncryptorWriterHandle", "long");
+    type_map.insert("SEReaderHandle", "long");
+    type_map.insert("SEWriterHandle", "long");
+    type_map.insert("SignPubKeyHandle", "long");
+    type_map.insert("SignSecKeyHandle", "long");
+    type_map.insert("FileContextHandle", "long");
+    type_map.insert("App", "long");
+    type_map.insert("Authenticator", "long");
+
+    let mut bindgen = unwrap!(Bindgen::new());
+    let mut lang = LangJava::new(type_map);
+
+    lang.set_namespace("net.maidsafe.safe_app");
+
+    let mut outputs = HashMap::new();
+
+    bindgen.source_file("../safe_core/src/lib.rs");
+    lang.set_lib_name("safe_core");
+    unwrap!(bindgen.compile(&mut lang, &mut outputs, false));
+
+    bindgen.source_file("../ffi_utils/src/lib.rs");
+    lang.set_lib_name("ffi_utils");
+    unwrap!(bindgen.compile(&mut lang, &mut outputs, false));
+
+    bindgen.source_file("src/lib.rs");
+    lang.set_lib_name(unwrap!(env::var("CARGO_PKG_NAME")));
+    unwrap!(bindgen.compile(&mut lang, &mut outputs, true));
+
+    unwrap!(bindgen.write_outputs(target_dir, &outputs));
+}
+
+fn gen_bindings_csharp() {
+    let target_dir = Path::new("../bindings/csharp/safe_app");
+    let test_idents = ["test_create_app", "test_create_app_with_access"];
+
+    let mut bindgen = unwrap!(Bindgen::new());
+    let mut lang = LangCSharp::new();
+
+    lang.set_lib_name(unwrap!(env::var("CARGO_PKG_NAME")));
+    lang.set_namespace("SafeApp");
+    lang.set_class_name("AppBindings");
+    lang.set_consts_class_name("AppConstants");
+    lang.set_types_file_name("AppTypes");
+    lang.set_utils_class_name("BindingUtils");
+    lang.add_const("ulong", "ASYM_PUBLIC_KEY_LEN", box_::PUBLICKEYBYTES);
+    lang.add_const("ulong", "ASYM_SECRET_KEY_LEN", box_::SECRETKEYBYTES);
+    lang.add_const("ulong", "ASYM_NONCE_LEN", box_::NONCEBYTES);
+    lang.add_const("ulong", "SYM_KEY_LEN", secretbox::KEYBYTES);
+    lang.add_const("ulong", "SYM_NONCE_LEN", secretbox::NONCEBYTES);
+    lang.add_const("ulong", "SIGN_PUBLIC_KEY_LEN", sign::PUBLICKEYBYTES);
+    lang.add_const("ulong", "SIGN_SECRET_KEY_LEN", sign::SECRETKEYBYTES);
+    lang.add_const("ulong", "XOR_NAME_LEN", XOR_NAME_LEN);
+    lang.add_opaque_type("App");
+
+    lang.reset_filter(FilterMode::Blacklist);
+    for &ident in &test_idents {
+        lang.filter(ident);
+    }
+
+    let mut outputs = HashMap::new();
+    bindgen.source_file("../safe_core/src/lib.rs");
+    unwrap!(bindgen.compile(&mut lang, &mut outputs, false));
+
+    bindgen.source_file("src/lib.rs");
+    unwrap!(bindgen.compile(&mut lang, &mut outputs, true));
+
+    unwrap!(bindgen.write_outputs(target_dir, &outputs));
+
+    // Testing utilities.
+    lang.set_class_name("MockAuthBindings");
+    lang.set_utils_enabled(false);
+
+    lang.reset_filter(FilterMode::Whitelist);
+    for &ident in &test_idents {
+        lang.filter(ident);
+        lang.blacklist_wrapper_function(ident);
+    }
+
+    bindgen.run_build(&mut lang, target_dir);
+
+    // Hand-written code.
+    for entry in unwrap!(fs::read_dir("resources")) {
+        let entry = unwrap!(entry);
+
+        if let Some(file) = entry.path().file_name() {
+            let file = unwrap!(file.to_str());
+
+            if file.ends_with(".cs") {
+                unwrap!(fs::copy(entry.path(), target_dir.join(file)));
+            }
+        }
+    }
 }

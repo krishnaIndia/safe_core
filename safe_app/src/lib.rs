@@ -76,6 +76,9 @@ pub use ffi::mutable_data::entry_actions::*;
 pub use ffi::mutable_data::metadata::*;
 pub use ffi::mutable_data::permissions::*;
 pub use ffi::nfs::*;
+pub use ffi::object_cache::*;
+#[cfg(any(test, feature = "testing"))]
+pub use ffi::test_utils::*;
 
 mod errors;
 pub mod object_cache;
@@ -88,8 +91,15 @@ mod tests;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 
+#[cfg(feature = "bindings-jni")]
+extern crate jni;
+#[cfg(feature = "bindings-jni")]
+mod bindings_jni;
+
 pub use self::errors::*;
 use self::object_cache::ObjectCache;
+#[cfg(feature = "bindings-jni")]
+pub use bindings_jni::*;
 use futures::{Future, future};
 use futures::stream::Stream;
 use futures::sync::mpsc as futures_mpsc;
@@ -107,8 +117,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::mpsc as std_mpsc;
-#[cfg(feature = "testing")]
-pub use test_utils::{test_create_app, test_create_app_with_access};
 use tokio_core::reactor::{Core, Handle};
 
 macro_rules! try_tx {

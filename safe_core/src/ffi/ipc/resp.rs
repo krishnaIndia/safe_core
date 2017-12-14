@@ -19,7 +19,7 @@
 
 use ffi::MDataInfo;
 use ffi::arrays::*;
-use ffi::ipc::req::PermissionSet as FfiPermissionSet;
+use ffi::ipc::req::PermissionSet;
 use rust_sodium::crypto::sign;
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -115,17 +115,21 @@ pub struct AccessContInfo {
 #[repr(C)]
 pub struct AccessContainerEntry {
     /// Pointer to the array of `ContainerInfo`.
-    pub ptr: *const ContainerInfo,
+    pub containers_ptr: *const ContainerInfo,
     /// Size of the array.
-    pub len: usize,
+    pub containers_len: usize,
     /// Internal field used by rust memory allocator.
-    pub cap: usize,
+    pub containers_cap: usize,
 }
 
 impl Drop for AccessContainerEntry {
     fn drop(&mut self) {
         unsafe {
-            let _ = Vec::from_raw_parts(self.ptr as *mut ContainerInfo, self.len, self.cap);
+            let _ = Vec::from_raw_parts(
+                self.containers_ptr as *mut ContainerInfo,
+                self.containers_len,
+                self.containers_cap,
+            );
         }
     }
 }
@@ -138,7 +142,7 @@ pub struct ContainerInfo {
     /// Container's `MDataInfo`
     pub mdata_info: MDataInfo,
     /// App's permissions in the container.
-    pub permissions: FfiPermissionSet,
+    pub permissions: PermissionSet,
 }
 
 impl Drop for ContainerInfo {
@@ -155,7 +159,7 @@ pub struct AppAccess {
     /// App's or user's public key
     pub sign_key: SignPublicKey,
     /// A list of permissions
-    pub permissions: FfiPermissionSet,
+    pub permissions: PermissionSet,
     /// App's user-facing name
     pub name: *const c_char,
     /// App id.
