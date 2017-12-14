@@ -17,15 +17,12 @@
 
 use super::{App, AppContext};
 use super::errors::AppError;
-use ffi_utils::{FFI_RESULT_OK, FfiResult, ReprC, catch_unwind_cb, from_c_str};
 use futures::{Future, IntoFuture};
 use safe_authenticator::test_utils as authenticator;
 use safe_core::{Client, FutureExt, utils};
-use safe_core::ffi::ipc::req::AuthReq;
 use safe_core::ipc::AppExchangeInfo;
 use safe_core::ipc::req::{AuthReq as NativeAuthReq, ContainerPermissions};
 use std::collections::HashMap;
-use std::os::raw::{c_char, c_void};
 use std::sync::mpsc;
 
 /// Generates an `AppExchangeInfo` structure for a mock application.
@@ -129,41 +126,4 @@ pub fn create_auth_req_with_access(
     access_info: HashMap<String, ContainerPermissions>,
 ) -> NativeAuthReq {
     create_auth_req(None, Some(access_info))
-}
-
-/// Creates a random app instance for testing.
-#[no_mangle]
-#[allow(unsafe_code)]
-pub unsafe extern "C" fn test_create_app(
-    app_id: *const c_char,
-    user_data: *mut c_void,
-    o_cb: extern "C" fn(user_data: *mut c_void,
-                        result: *const FfiResult,
-                        app: *mut App),
-) {
-    catch_unwind_cb(user_data, o_cb, || -> Result<(), AppError> {
-        let app_id = from_c_str(app_id)?;
-        let auth_req = create_auth_req(Some(app_id), None);
-        let app = create_app_by_req(&auth_req);
-        o_cb(user_data, FFI_RESULT_OK, Box::into_raw(Box::new(app)));
-        Ok(())
-    })
-}
-
-/// Create a random app instance for testing, with access to containers.
-#[no_mangle]
-#[allow(unsafe_code)]
-pub unsafe extern "C" fn test_create_app_with_access(
-    auth_req: *const AuthReq,
-    user_data: *mut c_void,
-    o_cb: extern "C" fn(user_data: *mut c_void,
-                        result: *const FfiResult,
-                        o_app: *mut App),
-) {
-    catch_unwind_cb(user_data, o_cb, || -> Result<(), AppError> {
-        let auth_req = NativeAuthReq::clone_from_repr_c(auth_req)?;
-        let app = create_app_by_req(&auth_req);
-        o_cb(user_data, FFI_RESULT_OK, Box::into_raw(Box::new(app)));
-        Ok(())
-    })
 }
